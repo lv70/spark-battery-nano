@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# local-only: IDE installer, personal bench log
+*.dmg
+BATTERY-LOG.md
