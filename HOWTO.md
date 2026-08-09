@@ -99,7 +99,11 @@ Easiest on a breadboard:
 2. Open the file `dji_spark_battery_recovery_nano/dji_spark_battery_recovery_nano.ino` in the IDE.
 3. Plug the Nano into your computer via USB (USB-C data cable for the reference board).
 4. In the IDE, from the menu bar: **Tools → Board → Arduino AVR Boards → Arduino Nano**.
-5. From the same **Tools** menu: **Port**, then pick the port that appeared when you plugged it in. The reference board uses a **CH340** USB chip: on a recent Mac it appears without installing anything, named like `/dev/cu.usbserial-XXXX` or `/dev/cu.wchusbserialXXXX`. If no port appears, first suspect the cable (it must be a data cable), then install the CH340 driver (search "CH340 driver mac/windows").
+5. From the same **Tools** menu: **Port**. To identify which entry is the Nano: unplug the Nano, open the Port menu and note what is already listed, plug the Nano in, and reopen the menu. The entry that just appeared is the Nano. Its name depends on the computer:
+   - **Windows:** `COM3`, `COM4` or similar, often labelled "USB-SERIAL CH340"
+   - **macOS:** `/dev/cu.usbserial-XXXX` or `/dev/cu.wchusbserialXXXX`
+   - **Linux:** `/dev/ttyUSB0` or similar
+   If no new entry appears, first suspect the cable (it must be a data cable, not a charge-only one), then install the CH340 driver for your operating system (search "CH340 driver" plus the OS name). On a recent Mac the CH340 needs no driver.
 6. Click the **→ Upload** button.
    - If upload fails with `avrdude: stk500_recv()` errors, switch **Tools → Processor** between **ATmega328P** and **ATmega328P (Old Bootloader)** and try again. Clones ship with either bootloader and this setting has to match. Newer USB-C clones usually work with the plain **ATmega328P** setting; older ones need Old Bootloader. The wrong choice does no harm; the upload just fails.
 7. Open the **Serial Monitor** (magnifying-glass icon, top right) and set the speed dropdown at the bottom to **115200 baud**.
