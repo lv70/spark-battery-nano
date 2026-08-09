@@ -99,14 +99,14 @@ Easiest on a breadboard:
 2. Open the file `dji_spark_battery_recovery_nano/dji_spark_battery_recovery_nano.ino` in the IDE.
 3. Plug the Nano into your computer via USB (USB-C data cable for the reference board).
 4. In the IDE, from the menu bar: **Tools → Board → Arduino AVR Boards → Arduino Nano**.
-5. From the same **Tools** menu: **Port**. To identify which entry is the Nano: unplug the Nano, open the Port menu and note what is already listed, plug the Nano in, and reopen the menu. The entry that just appeared is the Nano. Its name depends on the computer:
+5. In the IDE, from the menu bar: **Tools → Port**. To identify which entry is the Nano: unplug the Nano, open the Port menu and note what is already listed, plug the Nano in, and reopen the menu. The entry that just appeared is the Nano. Its name depends on the computer:
    - **Windows:** `COM3`, `COM4` or similar, often labelled "USB-SERIAL CH340"
    - **macOS:** `/dev/cu.usbserial-XXXX` or `/dev/cu.wchusbserialXXXX`
    - **Linux:** `/dev/ttyUSB0` or similar
    If no new entry appears, first suspect the cable (it must be a data cable, not a charge-only one), then install the CH340 driver for your operating system (search "CH340 driver" plus the OS name). On a recent Mac the CH340 needs no driver.
 6. Click the **→ Upload** button.
    - If upload fails with `avrdude: stk500_recv()` errors, switch **Tools → Processor** between **ATmega328P** and **ATmega328P (Old Bootloader)** and try again. Clones ship with either bootloader and this setting has to match. Newer USB-C clones usually work with the plain **ATmega328P** setting; older ones need Old Bootloader. The wrong choice does no harm; the upload just fails.
-7. Open the **Serial Monitor** (magnifying-glass icon, top right) and set the speed dropdown at the bottom to **115200 baud**.
+7. In the IDE, from the menu bar: **Tools → Serial Monitor** and set the speed dropdown at the bottom to **115200 baud**.
 
 You should see the welcome banner and a menu. Garbage characters mean the baud rate is wrong.
 
@@ -118,7 +118,12 @@ The chip inside the battery is itself unpowered when the battery is deeply disch
 2. Touch the **red (+) wire to battery Pin 3** and the **black (−) wire to battery Pin 2**.
 3. **Hold them there.** LEDs blinking on the Spark battery indicate the chip has woken up.
 
-The 9V must be held in place during the whole recovery (about 15 seconds), so a helper or some tape is useful.
+The 9V must stay in place during the whole recovery (about 15 seconds), so a helper or some tape is useful. A reliable hands-free rig: seat two spare jumper pins in Pins 3 and 2 (pre-bent tips, as in Step 1), connect the 9V leads to the jumper tails with alligator clips, and tape the bundle down.
+
+Two notes on verifying the boost:
+
+- The `Pack voltage` line in the status screen reads the **cells**, not the 9V, so it may barely rise even when the boost is working (deeply discharged cells accept little or no current). Do not use it as the boost check.
+- To verify with a multimeter: measure DC volts across battery Pins 3 and 2 at the connector. The 9V's full voltage there means the chip is being fed. A 9V that reads healthy on its own but sags badly while connected is worn out; replace it.
 
 ## Step 5: Read-only checks
 
@@ -126,7 +131,7 @@ Before changing anything on the battery, confirm communication works using comma
 
 1. If the battery is dead, hold the 9V boost (Step 4) during each check below.
 2. Press **`S`** (scan). Expect: `0x0B <- DJI BMS`. This proves the wiring and pull-ups work.
-3. Press **`1`** (status). Expect: a plausible pack voltage, a `Seal state`, and a `PF status` line. A locked battery shows `PERMANENT FAIL (needs clearing)`, confirming the diagnosis.
+3. Press **`1`** (status). Expect: a plausible pack voltage, a temperature, and a `Batt flags` line. On a locked battery the flags typically include `StopChargeAlarm` and `StopDischargeAlarm` even though the pack is empty; that combination confirms the diagnosis. The screen can also show `Seal state`, `Safety status`, and `PF status` lines, but on many DJI packs the firmware refuses those three reads and the lines simply never print, in any state. That is normal and does not block recovery.
 4. Press **`H`** (health). Expect: serial number, cycle count, capacity figures. Worth recording as a "before" snapshot.
 
 Only move on to Step 6 once all three respond sensibly. If they do not, go back over Step 2 and the troubleshooting table; no command in this step can have changed anything.
@@ -156,10 +161,14 @@ Only move on to Step 6 once all three respond sensibly. If they do not, go back 
 
 Normal behaviour that can look like an error:
 - A "NACK" or error on the very first unseal attempt is expected; it is a security feature of the chip.
-- The voltage shown during recovery (~8.2V) is the 9V battery feeding through, not the real cell voltage.
+- The voltage shown during recovery may read high (~8.2V, the 9V feeding through) or may stay near the flat cell voltage; neither indicates a problem.
+- `PF status unreadable after commands` is normal on packs whose firmware blocks that read (see Step 5). Judge success by the `Batt flags` line instead: after a successful clear the `StopChargeAlarm`/`StopDischargeAlarm` bits disappear, and the charger accepts the pack.
 - "Not sealed" at the very end is harmless; the chip re-locks itself on restart.
+- "Unsealed only (may need FA)" is fine; the PF clear works from the Unsealed state.
 
 ## Step 7: First charge (supervised)
+
+**Charge promptly, and to completion.** A recovered pack that is left deeply discharged can set the Permanent Fail flag again within weeks, and the recovery has to be repeated. Recovery is not finished until the pack has completed a full charge; watch that the charger actually runs through to full rather than stalling partway.
 
 Charge the battery on a fireproof surface and check on it periodically. When full, insert it in the drone and check the reported battery health in the DJI app. If the battery drains abnormally fast or the app reports large cell-voltage differences, the cells are worn: use it as a bench/testing battery at most, and recycle it eventually.
 
@@ -182,6 +191,7 @@ Charge the battery on a fireproof surface and check on it periodically. When ful
 | `READ ERROR` on voltage | Same causes as above |
 | All PF commands say NACK | Chip did not unseal: press `U` first, then `P`. If `U` fails repeatedly, check wiring |
 | Recovery ran but battery still won't charge | Press `A` again (some batteries need two rounds), and hold the 9V boost the whole time |
+| `Seal state` / `Safety status` / `PF status` lines never print | Normal on many DJI packs: the firmware refuses those reads even after unsealing. Diagnose from the `Batt flags` line; verify recovery with the charger |
 | LEDs never blink during 9V boost | Check the 9V battery is fresh; check +→Pin 3, −→Pin 2; hold firmly (the pins are small) |
 
 ---
