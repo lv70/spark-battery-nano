@@ -98,8 +98,8 @@ Easiest on a breadboard:
 1. Download the **Arduino IDE** from [arduino.cc/en/software](https://www.arduino.cc/en/software) and install it.
 2. Open the file `dji_spark_battery_recovery_nano/dji_spark_battery_recovery_nano.ino` in the IDE.
 3. Plug the Nano into your computer via USB (USB-C data cable for the reference board).
-4. In the IDE: **Tools → Board → Arduino AVR Boards → Arduino Nano**.
-5. **Tools → Port**: pick the port that appeared when you plugged it in. The reference board uses a **CH340** USB chip: on a recent Mac it appears without installing anything, named like `/dev/cu.usbserial-XXXX` or `/dev/cu.wchusbserialXXXX`. If no port appears, first suspect the cable (it must be a data cable), then install the CH340 driver (search "CH340 driver mac/windows").
+4. In the IDE, from the menu bar: **Tools → Board → Arduino AVR Boards → Arduino Nano**.
+5. From the same **Tools** menu: **Port**, then pick the port that appeared when you plugged it in. The reference board uses a **CH340** USB chip: on a recent Mac it appears without installing anything, named like `/dev/cu.usbserial-XXXX` or `/dev/cu.wchusbserialXXXX`. If no port appears, first suspect the cable (it must be a data cable), then install the CH340 driver (search "CH340 driver mac/windows").
 6. Click the **→ Upload** button.
    - If upload fails with `avrdude: stk500_recv()` errors, switch **Tools → Processor** between **ATmega328P** and **ATmega328P (Old Bootloader)** and try again. Clones ship with either bootloader and this setting has to match. Newer USB-C clones usually work with the plain **ATmega328P** setting; older ones need Old Bootloader. The wrong choice does no harm; the upload just fails.
 7. Open the **Serial Monitor** (magnifying-glass icon, top right) and set the speed dropdown at the bottom to **115200 baud**.
