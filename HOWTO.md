@@ -131,7 +131,7 @@ Before changing anything on the battery, confirm communication works using comma
 
 1. If the battery is dead, hold the 9V boost (Step 4) during each check below.
 2. Press **`S`** (scan). Expect: `0x0B <- DJI BMS`. This proves the wiring and pull-ups work.
-3. Press **`1`** (status). Expect: a plausible pack voltage, a temperature, and a `Batt flags` line. On a locked battery the flags typically include `StopChargeAlarm` and `StopDischargeAlarm` even though the pack is empty; that combination confirms the diagnosis. The screen can also show `Seal state`, `Safety status`, and `PF status` lines, but on many DJI packs the firmware refuses those three reads and the lines simply never print, in any state. That is normal and does not block recovery.
+3. Press **`1`** (status). Expect: a plausible pack voltage, a temperature, and a `Batt flags` line. On a locked battery the flags typically include `StopChargeAlarm` and `StopDischargeAlarm` even though the pack is empty; that combination confirms the diagnosis. The screen can also show `Seal state`, `Safety status`, and `PF status` lines, but on many DJI packs those reads fail through the register path this sketch uses (ManufacturerBlockAccess, 0x44) and the lines never print, in any state. That is normal and does not block recovery; the clear commands still work.
 4. Press **`H`** (health). Expect: serial number, cycle count, capacity figures. Worth recording as a "before" snapshot.
 
 Only move on to Step 6 once all three respond sensibly. If they do not, go back over Step 2 and the troubleshooting table; no command in this step can have changed anything.
