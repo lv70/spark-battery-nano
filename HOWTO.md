@@ -62,7 +62,7 @@ Look at the connector on the Spark battery (where it plugs into the drone). It h
 
 ## Step 2: Wire it up
 
-The Nano's data pins for this job are fixed in hardware: **A4 and A5** (on the same side as the analog pins, labelled on the board).
+The Nano's data pins for this job are fixed in hardware: **A4 and A5** (labelled on the board).
 
 | Spark battery pin | → | Arduino Nano pin |
 |---|---|---|
