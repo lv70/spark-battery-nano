@@ -38,11 +38,11 @@ Despite the name, the flag is a setting in the chip's memory, not physical damag
 
 ## Step 1: Find the battery connector pins
 
-Look at the connector on the Spark battery (where it plugs into the drone). It has **6 pins**. Hold the battery so the **notch/keying of the connector is on top**, and number the pins **1 to 6, left to right**:
+Look at the connector on the Spark battery (where it plugs into the drone). It has **6 pins**. Hold the battery **portrait, with the pins facing you, at the top**, and number the pins **1 to 6, left to right**:
 
 ```
  ┌─────────────────────────────┐
- │  1    2    3    4    5    6 │   ← notch on top
+ │  1    2    3    4    5    6 │   ← pins at top, facing you
  └──┬────┬────┬────┬────┬────┬─┘
    SCL  GND  BAT+ BAT+ GND  SDA
 ```
