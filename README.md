@@ -15,7 +15,7 @@ Recovers DJI Spark batteries stuck in **Permanent Fail** mode (the battery will 
 2. Upload the sketch (board: Arduino Nano) and open the Serial Monitor at 115200 baud.
 3. If the pack is completely dead, hold a 9V battery to Pin 3 (+) and Pin 2 (−) to wake it.
 4. Press `1` first and check the `Lowest cell` / `PF status` lines, then press `A`. Keep the 9V held until the reset completes, then charge on the official DJI charger.
-5. If the sketch reports `PF RE-LATCHED within 5 s of reset`, a cell is below the chip's ~2.2 V undervoltage threshold and no clear will hold until it rises. See [HOWTO.md](HOWTO.md#if-pf-re-latches-after-reset).
+5. If the sketch reports `PF RE-LATCHED within 5 s of reset`, a cell is below the chip's ~2.2 V undervoltage threshold and no clear will hold until it rises. `K` (pump) is the way through that; read [HOWTO.md](HOWTO.md#if-pf-re-latches-after-reset) first.
 
 **Target board:** "Nano 3.0 compatible" clone (USB-C connector, CH340 USB-serial chip, ATmega328P @ 16 MHz, bootloader pre-installed). In the Arduino IDE select board **Arduino Nano**; try processor **ATmega328P** first and fall back to **ATmega328P (Old Bootloader)** if upload fails. Any ATmega328P-based Nano or Uno works. Very old Nano 2.x boards (ATmega168) do not have enough flash for this sketch, and the Nano Every is not supported (the wiring self-test uses ATmega328P registers directly).
 
@@ -50,9 +50,10 @@ Additions beyond upstream:
 - **`T` bus stress test:** 300 rapid reads with an error count, used as a go/no-go check on connection quality before writing to the chip.
 - **`D` CSV status line:** read-only, same column layout as dvdsosa's `monitor_charge.sh`, so that live precharge monitor can be used with this sketch.
 - **Re-latch check after reset:** `R` waits 5 s after the chip restarts and reports whether PF came back. That distinguishes a pack whose cells are too low from a failed unlock.
+- **`K` pump mode:** for packs with a cell below ~2.2 V, repeats unseal → clear → reset so the chip precharges in the 2–3 s before each re-latch, until PF stays clear. Procedure from dvdsosa; confirmation prompt, round limit, temperature cutoff and key-press abort built in. Read the safety notes in [HOWTO.md](HOWTO.md#if-pf-re-latches-after-reset) first.
 - **Bug fixes vs upstream:** (1) BatteryStatus was read from register `0x19`, which per the SBS spec is DesignVoltage; the flags line was decoding the design voltage as fault bits. Now reads `0x16` (BatteryStatus). (2) The flag decode used wrong bit positions/labels (e.g. printed "FullyCharged" for the Discharging bit, and took the error code from bits 12–15 instead of 0–3); now matches the SBS BatteryStatus bit map.
 
-Verified to compile with `arduino-cli` against `arduino:avr:nano`: 60% of flash, 21% of RAM. The health screen and the wiring/bus-test tools account for most of the growth over the bare port; there is still comfortable headroom on a 328P.
+Verified to compile with `arduino-cli` against `arduino:avr:nano`: 70% of flash, 21% of RAM. The health screen and the wiring/bus-test tools account for most of the growth over the bare port; there is still comfortable headroom on a 328P.
 
 ## License
 

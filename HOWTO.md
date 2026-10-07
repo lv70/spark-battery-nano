@@ -193,7 +193,9 @@ Normal behaviour that can look like an error:
 
 If the output ends with `PF RE-LATCHED within 5 s of reset`, the unlock worked but the chip immediately found the same fault again: one of the cells is below its undervoltage threshold (measured by the dvdsosa project at about 2.2 V). No amount of clearing will hold until that cell rises, and the chip's charge path is disabled, so the DJI charger cannot raise it.
 
-What is known to work, from [dvdsosa/dji-spark-battery-unbrick](https://github.com/dvdsosa/dji-spark-battery-unbrick), which recovered two packs with cells between 1.77 V and 2.2 V this way: during the 2–3 s between a reset and the re-latch, the chip precharges the cells from the wake-up supply (about 13 mA with a 12 V supply through 100 Ω). Repeating unseal → clear → reset ("pumping") lifts the lowest cell by 6–10 mV per round until it crosses the threshold, after which the chip stays in normal precharge on its own. Their `pf_pump.sh` automates this against their sketch; their `monitor_charge.sh` (read-only) works with this sketch too, via the `D` command.
+What is known to work, from [dvdsosa/dji-spark-battery-unbrick](https://github.com/dvdsosa/dji-spark-battery-unbrick), which recovered two packs with cells between 1.77 V and 2.2 V this way: during the 2–3 s between a reset and the re-latch, the chip precharges the cells from the wake-up supply (about 13 mA with a 12 V supply through 100 Ω). Repeating unseal → clear → reset ("pumping") lifts the lowest cell by 6–10 mV per round until it crosses the threshold, after which the chip stays in normal precharge on its own.
+
+This sketch has that procedure built in as **`K`**. It reads the pack, asks you to type `y`, then runs rounds of unseal → clear → reset, waiting 5 s after each reset and printing one line per round with the three cell voltages, the lowest, the spread, the temperature and whether PF re-latched. It stops by itself when PF stays clear for 10 s (success), after 90 rounds, if the temperature passes 35 °C, if an unseal fails, if the chip stops answering, or when you press any key. On success it says so and re-seals the chip. Leave the 9V boost connected afterwards: the chip is now precharging the cells from it, and the `PCHG` marker on a `1` or `D` reading confirms that. Move to the DJI charger only once the lowest cell is well above 3.0 V. From 1.8 V expect 40 to 60 rounds, roughly 10 minutes, so use the hands-free boost rig from Step 4 and a fresh PP3. dvdsosa's read-only `monitor_charge.sh` also works with this sketch via the `D` command if you want a live display during the precharge.
 
 Before trying it, understand what it is: deliberately re-clearing a safety fault on deeply discharged lithium cells, dozens of times. Each re-latch is a write to the chip's flash, which has limited endurance. It is two people's reported successes, not a validated repair. Do it outdoors or on a fireproof surface, with a current-limited supply, watching the temperature, and treat a pack recovered this way as suspect for flight. A cell that has sat below 2.0 V may have grown copper dendrites and can fail during charge even if the numbers look fine afterwards.
 
@@ -243,6 +245,7 @@ Charge the battery on a fireproof surface and check on it periodically. When ful
 | `R` | Restart the chip, then wait 5 s and report whether PF came back |
 | `L` | Re-seal the chip |
 | `A` | All of the above, in order: the normal recovery path |
+| `K` | Pump: repeat `A` while PF re-latches, for packs with a cell below ~2.2 V. Asks for confirmation; stops on success, 90 rounds, 35 °C, lost contact or a key press. See [If PF re-latches after reset](#if-pf-re-latches-after-reset) |
 
 ---
 

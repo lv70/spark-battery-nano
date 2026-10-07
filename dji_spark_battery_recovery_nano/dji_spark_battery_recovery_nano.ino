@@ -42,6 +42,10 @@
  *                  a cell is still below the undervoltage threshold)
  *  L → Seal (re-lock)
  *  A → All of the above automatically (second round if PF survives reset)
+ *  K → Pump: repeat U→P→R while a cell is below the undervoltage threshold.
+ *      The BMS precharges for the 2-3 s between reset and re-latch, so each
+ *      round lifts the cells a few mV until the PF stops re-latching.
+ *      (Procedure from dvdsosa/dji-spark-battery-unbrick, pf_pump.sh.)
  *
  * ── Protocol notes (TI bq40z50-R2 TRM SLUUBK0, which the Z307 follows) ───
  *  Status subcommands are written to ManufacturerAccess (0x00) and the reply
@@ -745,6 +749,158 @@ void autoRecover() {
     }
 }
 
+// ── Pump mode ─────────────────────────────────────────────────────────────
+// With a cell below ~2.2 V the BMS re-latches the undervoltage PF 2-3 s after
+// a reset. In that window it precharges from the wake-up supply, lifting the
+// cells by roughly 6-10 mV per round. Repeat until the PF stays clear, then
+// the BMS continues precharging on its own (PCHG bit).
+//
+// Every round that re-latches is a write to the chip's data flash (limited
+// endurance), and this is deliberately re-clearing a safety fault on deeply
+// discharged lithium cells. Round limit, temperature cutoff and key-press
+// abort are built in. Keep the wake-up supply connected throughout.
+
+#define PUMP_MAX_ROUNDS   90
+#define PUMP_TEMP_STOP_DK 3081    // 35.0 C in deci-kelvin (273.15 + 35) * 10
+#define PUMP_REST_MS      5000    // settle after reset before sampling
+#define PUMP_CONFIRM_MS   10000   // PF must stay clear this long to count
+
+char waitKey() {
+    while (!Serial.available()) {}
+    char c = Serial.read();
+    delay(20);
+    while (Serial.available()) Serial.read();
+    return c;
+}
+
+// One sample of the pack. Returns false if the bus did not answer.
+bool pumpSample(int32_t& vmin, int32_t& spread, int32_t& tempDk, bool& pf, bool& pchg) {
+    const uint8_t cellReg[3] = { R_CELL1, R_CELL2, R_CELL3 };
+    int32_t cv[3];
+    vmin = 0; int32_t vmax = 0;
+    for (uint8_t i = 0; i < 3; i++) {
+        cv[i] = readWord(cellReg[i]);
+        if (cv[i] <= 0) return false;
+        if (!vmin || cv[i] < vmin) vmin = cv[i];
+        if (cv[i] > vmax) vmax = cv[i];
+    }
+    spread = vmax - vmin;
+    tempDk = readWord(R_TEMP);
+    if (tempDk < 0) return false;
+    uint32_t op = 0, pfs = 0;
+    if (!macRead32(MAC_OP_STATUS, op)) return false;
+    macRead32(MAC_PF_STATUS, pfs);
+    pf   = (op & OP_PF) || pfs;
+    pchg = op & OP_PCHG;
+    Serial.print(F("  cells ")); Serial.print(cv[0]); Serial.print('/');
+    Serial.print(cv[1]); Serial.print('/'); Serial.print(cv[2]);
+    Serial.print(F("  min ")); Serial.print(vmin);
+    Serial.print(F("  spread ")); Serial.print(spread);
+    Serial.print(F("  ")); Serial.print(tempDk / 10.0f - 273.15f, 1); Serial.print(F(" C"));
+    Serial.print(F("  PF ")); Serial.print(pf ? F("LATCHED") : F("clear"));
+    if (pchg) Serial.print(F("  PCHG"));
+    Serial.println();
+    return true;
+}
+
+bool pumpUnseal() {
+    uint8_t sec = readSec();
+    if (sec == 0) return false;
+    if (sec != SEC_SEALED) return true;
+    for (uint8_t i = 0; i < 5; i++) {
+        sendKey(KEY_SPARK);
+        sec = readSec();
+        if (sec == SEC_UNSEALED || sec == SEC_FULL) return true;
+        delay(200);
+    }
+    return false;
+}
+
+void pumpMode() {
+    Serial.println(F("\n[K] PUMP: repeat Unseal -> Clear PF -> Reset while PF re-latches"));
+    if (!present()) { Serial.println(F("[!] No reply at 0x0B. Apply the 9V boost first.")); return; }
+
+    int32_t vmin, spread, tempDk; bool pf, pchg;
+    Serial.println(F("[K] Start:"));
+    if (!pumpSample(vmin, spread, tempDk, pf, pchg)) {
+        Serial.println(F("[!] Could not read the pack. Run T and fix the contacts first."));
+        return;
+    }
+    if (!pf) {
+        Serial.println(F("[K] PF is not latched. Nothing to pump; use D/1 to watch the charge."));
+        return;
+    }
+
+    Serial.println(F("\n[K] This re-clears a safety fault on deeply discharged cells, up to"));
+    Serial.print(F("    ")); Serial.print(PUMP_MAX_ROUNDS);
+    Serial.println(F(" times. Each re-latch is a flash write. Keep the 9V boost on throughout."));
+    Serial.println(F("    Do this on a fireproof surface. Press any key during the run to stop."));
+    if (vmin < 2000) {
+        Serial.print(F("    Lowest cell ")); Serial.print(vmin);
+        Serial.println(F(" mV is below 2.0 V: possible internal damage."));
+    }
+    Serial.println(F("    Type y to continue:"));
+    char c = waitKey();
+    if (c != 'y' && c != 'Y') { Serial.println(F("[K] Cancelled. Nothing written.")); return; }
+
+    int32_t startMin = vmin;
+    uint8_t commFails = 0;
+    for (uint16_t r = 1; r <= PUMP_MAX_ROUNDS; r++) {
+        if (Serial.available()) {
+            while (Serial.available()) Serial.read();
+            Serial.println(F("[K] Stopped by key press."));
+            break;
+        }
+        Serial.print(F("[K] round ")); Serial.println(r);
+
+        if (!pumpUnseal()) { Serial.println(F("[!] Unseal failed. Stopping.")); break; }
+
+        busTimeout(BUS_TIMEOUT_SLOW_US);
+        mac00Write(MAC_PF_DATA_RESET);
+        delay(1000);
+        if (pfActive()) { mac00Write(MAC_PF_DATA_RESET); delay(1000); }   // one retry
+        mac00Write(MAC_RESET);
+        busTimeout(BUS_TIMEOUT_FAST_US);
+
+        bool back = false;
+        for (uint8_t i = 0; i < 30; i++) { delay(100); if (present()) { back = true; break; } }
+        if (!back) { Serial.println(F("[!] BMS did not come back after reset. Boost dropped? Stopping.")); break; }
+        delay(PUMP_REST_MS);
+
+        if (!pumpSample(vmin, spread, tempDk, pf, pchg)) {
+            if (++commFails >= 3) { Serial.println(F("[!] Lost communication. Stopping.")); break; }
+            Serial.println(F("  (sample failed, retrying next round)"));
+            continue;
+        }
+        commFails = 0;
+
+        if (tempDk >= PUMP_TEMP_STOP_DK) {
+            Serial.println(F("[!] Temperature above 35 C. STOP: disconnect the supply."));
+            break;
+        }
+        if (!pf) {
+            delay(PUMP_CONFIRM_MS);
+            Serial.println(F("[K] confirm:"));
+            if (pumpSample(vmin, spread, tempDk, pf, pchg) && !pf) {
+                Serial.print(F("\n[OK] PF stays clear after ")); Serial.print(r);
+                Serial.print(F(" round(s). Lowest cell ")); Serial.print(startMin);
+                Serial.print(F(" -> ")); Serial.print(vmin); Serial.println(F(" mV."));
+                Serial.println(F("     Leave the 9V boost on; the BMS should now precharge by itself."));
+                Serial.println(F("     Watch with 1 or D. Move to the DJI charger once the lowest cell"));
+                Serial.println(F("     is comfortably above 3.0 V, and supervise that first charge."));
+                doSeal();
+                return;
+            }
+            Serial.println(F("  PF came back during confirm; continuing."));
+        }
+    }
+    Serial.print(F("\n[K] Ended with PF ")); Serial.print(pf ? F("LATCHED") : F("clear"));
+    Serial.print(F(". Lowest cell ")); Serial.print(startMin);
+    Serial.print(F(" -> ")); Serial.print(vmin); Serial.println(F(" mV."));
+    if (pf) Serial.println(F("    If the cells rose but did not reach ~2.2 V, more rounds may get there."));
+    doSeal();
+}
+
 // ── Arduino entry points ──────────────────────────────────────────────────
 
 void printMenu() {
@@ -763,6 +919,7 @@ void printMenu() {
     Serial.println(F("  R  Reset chip (then checks whether PF re-latches)"));
     Serial.println(F("  L  Seal (re-lock)"));
     Serial.println(F("  A  Auto: full recovery sequence"));
+    Serial.println(F("  K  Pump: repeat A while PF re-latches (cells below ~2.2 V)"));
     Serial.println(F("---------------------------------------"));
     Serial.print(F("Choice: "));
 }
@@ -808,6 +965,7 @@ void loop() {
         case 'R': doReset();        break;
         case 'L': doSeal();         break;
         case 'A': autoRecover();    break;
+        case 'K': pumpMode();       break;
         default:  break;
     }
     printMenu();
