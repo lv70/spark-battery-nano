@@ -1,219 +1,195 @@
 # Recovering a DJI Spark battery with an Arduino Nano
 
-A step-by-step guide for beginners. No soldering is required if you have jumper wires that fit the battery connector.
+A step-by-step guide for beginners. No soldering needed.
 
----
+**What is wrong with the battery.** Inside every Spark battery is a small chip that protects the cells. If the battery sits unused for a long time, the cells run down below the chip's safety limit. The chip then sets a "Permanent Fail" flag and switches the battery off. The charger ignores it, the drone does not see it, and the lights blink an error.
 
-## Background
-
-Every DJI Spark battery contains a battery management chip (a Texas Instruments BQ40Z307) whose job is to protect the battery cells. If the battery is left unused for long enough, the cells discharge below the chip's safety threshold. The chip then sets a **Permanent Fail** flag and disconnects the battery: the charger will not charge it, the drone will not see it, and the LEDs blink an error pattern.
-
-Despite the name, the flag is a setting in the chip's memory, not physical damage. The chip has a service interface (two data wires) through which the flag can be cleared and the chip restarted. That is what the Arduino sketch does. DJI's repair centres perform the same operation with a dedicated USB adapter; the Nano replaces that adapter.
+**What this guide does.** The flag is a setting in the chip's memory, not physical damage. An Arduino Nano can talk to the chip through two data pins, clear the flag and restart it. If the cells have gone very low, the sketch can also nudge them back up until the flag will stay cleared.
 
 ---
 
 ## Safety
 
-- **Lithium batteries can catch fire.** A battery that sat deeply discharged for years may have damaged cells. After recovery, do the **first full charge outdoors or on a fireproof surface, and stay nearby.** If the battery gets hot, swells, or gives off a sweet or chemical smell, stop and dispose of it at a battery recycling point.
-- **If the battery pack is swollen, do not attempt recovery. Recycle it.** In that case the cells are the problem, not the flag.
-- **Never connect the 9V battery to the Arduino.** The 9V only ever touches the Spark battery's power pins (Pins 3 and 2). 9V into an Arduino data pin destroys the Arduino.
-- **Do not short pins.** Pin 3/4 (battery +) touching Pin 1 or 6 (data) can damage the chip you are trying to talk to. Work slowly and double-check before powering anything.
-- This procedure voids any warranty and is at your own risk. A recovered battery is a repaired battery: treat it with more suspicion than a new one, and do not fly over people with it.
+- **Lithium batteries can catch fire.** Do the first charge on a fireproof surface, with you nearby. If the pack gets hot, swells or smells, stop and recycle it.
+- **A swollen pack is finished.** Do not try to recover it.
+- **The 9V battery never touches the Arduino.** It only ever goes to the Spark battery's power pins. 9V into an Arduino pin destroys the Arduino.
+- **Do not let the Spark's + pins touch its data pins.** Work slowly and check before powering anything.
+- A recovered battery has had a hard life. Treat it with more suspicion than a new one.
 
 ---
 
-## Parts list
+## What you need
 
-| Item | Notes | Rough cost |
+| Item | Notes | Cost |
 |---|---|---|
-| Arduino Nano | The classic ATmega328P version. Clones are fine. An Arduino **Uno** also works: same pins (A4/A5), same sketch. | £3–20 |
-| USB cable for the Nano | Older clones use **mini-USB**; newer ones use **USB-C**. Must be a *data* cable, not a charge-only one | £2 |
-| 2 × 4.7 kΩ resistors | Any wattage. 2.2–10 kΩ also works (two 10 kΩ twisted in parallel = 5 kΩ, also fine) | <£1 |
-| Breadboard + jumper wires | "Dupont" male-to-male wires. The wires need a thin single pin to reach into the battery connector; a standard male Dupont pin fits | £5 |
-| 9V battery (PP3) + battery clip | Only needed if the battery is completely dead (it usually is) | £3 |
-
-> **Reference board:** this guide was written against a "Nano 3.0 compatible" clone (USB-C connector, CH340 USB chip, ATmega328P @ 16 MHz, bootloader pre-installed). The notes below call out where the board choice matters (USB driver and bootloader setting).
+| Arduino Nano | Any ATmega328P Nano or Uno. Clones are fine | £3 to £20 |
+| USB data cable | Mini-USB or USB-C to match the Nano. A charge-only cable will not work | £2 |
+| 2 resistors, 4.7 kΩ | Anything from 2.2 to 10 kΩ is fine | under £1 |
+| Breadboard and jumper wires | Male-to-male "Dupont" wires. The pins fit the Spark connector | £5 |
+| 9V battery (PP3) and clip | Wakes up the dead battery | £3 |
+| Multimeter | Optional, but useful for checking the 9V | |
 
 ---
 
-## Step 1: Find the battery connector pins
+## Step 1: Learn the battery pins
 
-Look at the connector on the Spark battery (where it plugs into the drone). It has **6 pins**. Hold the battery **portrait, with the pins facing you, at the top**, and number the pins **1 to 6, left to right**:
+Hold the Spark battery upright with the connector pins at the top, facing you. Number the six pins **1 to 6 from left to right**.
 
 ```
  ┌─────────────────────────────┐
- │  1    2    3    4    5    6 │   ← pins at top, facing you
+ │  1    2    3    4    5    6 │
  └──┬────┬────┬────┬────┬────┬─┘
    SCL  GND  BAT+ BAT+ GND  SDA
 ```
 
-- Pins 1 and 6 (the outer ones) are the two **data** lines (SCL and SDA)
-- Pins 2 and 5 are **ground** (−)
-- Pins 3 and 4 are the **battery + output** (never connect these to the Arduino)
-
-> ### Getting a reliable connection
->
-> The Spark connector is designed for a mating plug, not bare jumper pins, so contact reliability is the most common point of failure. Intermittent scans, `READ ERROR`, or a bus stress test that starts clean and then reports a burst of errors almost always trace back to the connector. A pin can touch the contact without gripping it, and the spring of the wire then levers it off a few seconds later. In order of effectiveness:
->
-> 1. **Pre-bend the last ~2 mm of each jumper pin by about 15°.** Insert it with the bend facing the metal contact side of the slot, so the tip springs against the contact instead of resting on it.
-> 2. **Tape the wire bundle to the battery body** a few cm back from the connector, so the weight and spring of the wires cannot twist the tips out. (This alone was sufficient on the three batteries used to develop this guide.)
-> 3. **Verify with software, not by eye.** Do not judge seating by the LEDs. Run **`T`** (bus stress test) and proceed only after a clean **0-error** run with hands off the wiring. That confirms the contact will survive an unattended recovery.
-> 4. **For repeated use:** a "DJI Spark battery adapter board" (a small breakout PCB that converts the connector to solder pads or header pins) removes this failure mode entirely. Inexpensive, and worthwhile beyond the first couple of packs.
-
-## Step 2: Wire it up
-
-The Nano's data pins for this job are fixed in hardware: **A4 and A5** (labelled on the board).
-
-| Spark battery pin | → | Arduino Nano pin |
+| Pin | What it is | Goes to |
 |---|---|---|
-| Pin 6 (SDA) | → | **A4** |
-| Pin 1 (SCL) | → | **A5** |
-| Pin 2 (GND) | → | **GND** (any GND pin) |
+| 1 | SCL (data clock) | Nano **A5** |
+| 2 | GND (ground) | Nano **GND** and 9V **black** |
+| 3 | BAT+ | 9V **red** |
+| 4 | BAT+ | nothing |
+| 5 | GND | nothing |
+| 6 | SDA (data) | Nano **A4** |
 
-Then add the two pull-up resistors (each data line must be pulled toward a voltage or communication does not work):
+**Getting a good contact.** The connector is made for a plug, not for loose pins, and bad contact is the most common problem. Bend the last 2 mm of each jumper pin slightly so the tip presses against the metal inside the slot. Tape the wires to the battery body so they cannot twist out.
 
-- One 4.7 kΩ resistor between **A4 and the Nano's 5V pin**
-- One 4.7 kΩ resistor between **A5 and the Nano's 5V pin**
+---
 
-Easiest on a breadboard:
+## Step 2: Build the Nano side
 
-```
-   Spark Pin 6 ──────┬────────── Nano A4
-                   [4.7kΩ]
-   Spark Pin 1 ──┐   │     ┌──── Nano A5
-                 │   ├─────│──── Nano 5V
-                 │ [4.7kΩ] │
-                 └───┴─────┘
-   Spark Pin 2 ───────────────── Nano GND
-```
+Do this with **nothing connected to the Spark battery yet**.
 
-(Both resistors go from a data line to the 5V rail. Resistors are not polarized; orientation does not matter.)
+1. Put the Nano on the breadboard and plug it into your computer by USB.
+2. Run a jumper from **A4** to an empty row. This row is SDA.
+3. Run a jumper from **A5** to another empty row. This row is SCL.
+4. Put a resistor from the SDA row to the **5V** rail.
+5. Put a resistor from the SCL row to the **5V** rail.
+6. Run a jumper from a Nano **GND** pin to the **negative** rail.
 
-**Do not connect anything to battery pins 3, 4, or 5 yet.** The Nano itself is powered by its USB cable only.
+Breadboard rails are often split in the middle. If a resistor is on the far half of a rail, it is not connected. The self-test in Step 3 will catch this.
 
-Build the Nano side first and leave the three wires loose at the battery end. Step 3 includes a self-test (`W`) that proves the resistors and rails are right before the battery is involved; plug the battery in only after it passes.
+---
 
-> **Why 5V is acceptable here:** the BQ40Z307 is designed for laptop-style battery buses and its data pins are rated for 5V signals. On an I2C bus nothing actively drives the lines high; only the pull-up resistors do.
+## Step 3: Install and test the software
 
-## Step 3: Install the software
+1. Download and install the **Arduino IDE** from arduino.cc.
+2. Open `dji_spark_battery_recovery_nano/dji_spark_battery_recovery_nano.ino`.
+3. In the menu bar: **Tools → Board → Arduino AVR Boards → Arduino Nano**.
+4. **Tools → Port**: unplug the Nano, look at the list, plug it back in. The entry that appears is the Nano.
+5. Click **Upload** (the arrow button).
+   - If it fails with `stk500` errors, change **Tools → Processor** to the other ATmega328P option and try again. Clones come with either setting.
+6. **Tools → Serial Monitor**. Set the speed at the bottom to **115200**.
 
-1. Download the **Arduino IDE** from [arduino.cc/en/software](https://www.arduino.cc/en/software) and install it.
-2. Open the file `dji_spark_battery_recovery_nano/dji_spark_battery_recovery_nano.ino` in the IDE.
-3. Plug the Nano into your computer via USB (USB-C data cable for the reference board).
-4. In the IDE, from the menu bar: **Tools → Board → Arduino AVR Boards → Arduino Nano**.
-5. In the IDE, from the menu bar: **Tools → Port**. To identify which entry is the Nano: unplug the Nano, open the Port menu and note what is already listed, plug the Nano in, and reopen the menu. The entry that just appeared is the Nano. Its name depends on the computer:
-   - **Windows:** `COM3`, `COM4` or similar, often labelled "USB-SERIAL CH340"
-   - **macOS:** `/dev/cu.usbserial-XXXX` or `/dev/cu.wchusbserialXXXX`
-   - **Linux:** `/dev/ttyUSB0` or similar
-   If no new entry appears, first suspect the cable (it must be a data cable, not a charge-only one), then install the CH340 driver for your operating system (search "CH340 driver" plus the OS name). On a recent Mac the CH340 needs no driver.
-6. Click the **→ Upload** button.
-   - If upload fails with `avrdude: stk500_recv()` errors, switch **Tools → Processor** between **ATmega328P** and **ATmega328P (Old Bootloader)** and try again. Clones ship with either bootloader and this setting has to match. Newer USB-C clones usually work with the plain **ATmega328P** setting; older ones need Old Bootloader. The wrong choice does no harm; the upload just fails.
-7. In the IDE, from the menu bar: **Tools → Serial Monitor** and set the speed dropdown at the bottom to **115200 baud**.
+You should see a menu. Garbage means the speed is wrong.
 
-You should see the welcome banner and a menu. Garbage characters mean the baud rate is wrong.
-
-8. **Before connecting the battery, press `W`** (wiring self-test). It checks that each data line is lifted high by its pull-up resistor and that the two lines are not shorted together, with nothing attached. Expect both `SDA (A4) pull-up: OK` and `SCL (A5) pull-up: OK`. A `FAIL` on either line means that resistor is missing, in the wrong breadboard row, or on a dead part of the 5V rail (breadboard rails often have a break in the middle). Fix it and press `W` again until both pass. A bus scan can never succeed with a failed pull-up, so this one test saves a lot of poking at the battery connector.
-
-## Step 4: Wake the dead battery (9V boost)
-
-The chip inside the battery is itself unpowered when the battery is deeply discharged; it cannot respond until it is fed some power:
-
-1. With the three wires from Step 2 connected, take the 9V battery with its clip.
-2. Touch the **red (+) wire to battery Pin 3** and the **black (−) wire to battery Pin 2**.
-3. **Hold them there.** LEDs blinking on the Spark battery indicate the chip has woken up.
-
-The 9V must stay in place during the whole recovery (about 15 seconds), so a helper or some tape is useful. A reliable hands-free rig: seat two spare jumper pins in Pins 3 and 2 (pre-bent tips, as in Step 1), connect the 9V leads to the jumper tails with alligator clips, and tape the bundle down.
-
-Two notes on verifying the boost:
-
-- The `Pack voltage` line in the status screen reads the **cells**, not the 9V, so it may barely rise even when the boost is working (deeply discharged cells accept little or no current). Do not use it as the boost check.
-- To verify with a multimeter: measure DC volts across battery Pins 3 and 2 at the connector. The 9V's full voltage there means the chip is being fed. A 9V that reads healthy on its own but sags badly while connected is worn out; replace it.
-
-## Step 5: Read-only checks
-
-Before changing anything on the battery, confirm communication works using commands that **only read**. They cannot alter the battery, so they can be repeated as often as needed:
-
-1. If the battery is dead, hold the 9V boost (Step 4) during each check below.
-2. Press **`S`** (scan). Expect: `0x0B <- DJI BMS`. This proves the wiring and pull-ups work.
-3. Press **`1`** (status). Expect: a plausible pack voltage, a temperature, a `Batt flags` line, and then the chip's own view of its state. On a locked battery a typical readout is:
+7. **Type `W` and press Enter.** This tests your breadboard with no battery attached. You want:
 
 ```
-Batt flags   : 0x48C0  StopChargeAlarm  StopDischargeAlarm  Discharging
-Device type  : 0x4307  (BQ9003/BQ40Z307 - OK)
-OpStatus     : 0x00007300
-  Security   : Sealed
-  PF active  : YES  <- locked
-  Charge     : disabled (XCHG)
-  Discharge  : disabled (XDSG)
-Safety status: 0x00000001  <- FAULTS ACTIVE
-  -> CUV: cell under-voltage
-PF status    : 0x00000001  <- PERMANENT FAIL (needs clearing)
-  -> SUV: cell under-voltage PF (deep discharge)
+[W]   SDA (A4) pull-up: OK
+[W]   SCL (A5) pull-up: OK
+[W]   Lines independent: OK
 ```
 
-   `Security: Sealed` plus `PF active: YES` is the expected starting point. If `OpStatus` says `unreadable`, the chip is not answering properly; fix the connection before going on.
-4. Press **`H`** (health). Expect: serial number, cycle count, capacity figures and **per-cell voltages**. Write down the lowest cell. Below about **2.2 V** the chip will set PF again within seconds of any clear, and the health screen says so. Below **2.0 V** the cell may be damaged.
+A `FAIL` means that resistor is missing, in the wrong row, or on a dead part of the rail. Fix it and press `W` again. Do not go on until both say OK.
 
-Only move on to Step 6 once all three respond sensibly and the lowest cell is known. If they do not, go back over Step 2 and the troubleshooting table; no command in this step can have changed anything.
+---
 
-> **No resistors yet?** This step can still be attempted: the Nano has weak built-in pull-ups, and over short wires (≤15 cm) reading often works with those alone. Two caveats: a failure proves nothing (it is probably the missing resistors, not the wiring), and do not run Step 6 until the real resistors are fitted. Reads on a marginal bus are harmless; writes are not worth the risk.
+## Step 4: Connect the battery
 
-## Step 6: Run the recovery
+1. Spark **pin 6** → the SDA row (A4).
+2. Spark **pin 1** → the SCL row (A5).
+3. Spark **pin 2** → the negative rail.
+4. 9V **black** → the negative rail.
+5. 9V **red** → Spark **pin 3**. Nowhere else.
 
-1. While holding the 9V boost, click into the Serial Monitor's input box, type **`A`** and press Enter.
-2. Watch the output. A successful run looks like:
+The 9V has to stay connected the whole time you are working on the battery, often for many minutes. Seat two spare jumper pins in Spark pins 3 and 2, clip the 9V leads to them with crocodile clips and tape it all down.
+
+If the Spark's lights blink, the chip is awake. If not, check the 9V with a multimeter across Spark pins 3 and 2: you want close to 9 V.
+
+---
+
+## Step 5: Read the battery (nothing is changed)
+
+These three commands only read. You can repeat them as often as you like.
+
+**`S`** finds the chip. You want `0x0B <- DJI BMS`. If it says `Nothing found!`, go to Troubleshooting.
+
+**`T`** checks the connection is stable. You want `0 errors` with your hands off the wires. If not, re-seat the pins. A bad connection halfway through a recovery wastes a round.
+
+**`1`** shows the chip's status. The lines that matter:
 
 ```
-[*] Pack voltage before: 8222 mV
-[*] Lowest cell: 2710 mV
-[U] Unseal
+  Security   : Sealed              <- normal starting point
+  PF active  : YES  <- locked      <- this is the problem
+Safety status: 0x00000001          <- see below
+PF status    : 0x00000001          <- SUV = ran down too far
+```
+
+**`H`** shows the three cell voltages. Write down the lowest one.
+
+Now you know which case you have:
+
+| Lowest cell | Safety status | What it means | Do |
+|---|---|---|---|
+| above 2200 mV | `OK` | Cells recovered on their own. Easy case | Step 6 |
+| below 2200 mV | `CUV` | A cell is still too low. The flag will come straight back | Step 7 |
+| below 2000 mV | `CUV` | Cell may be damaged. Your call | Step 7, with care |
+| one cell far below the others | | That cell is probably faulty | Consider recycling |
+
+---
+
+## Step 6: Clear the flag (the easy case)
+
+Hold the 9V on, type **`A`** and press Enter. A good run looks like this:
+
+```
 [U]   Spark key 0xCCDF7EE0 attempt 1 -> Unsealed
-[P] PermanentFailDataReset (0x0029)
 [P]   attempt 1 ACK  PF status 0x00000000  (cleared)
-[OK] PF cleared.
-[R] DeviceReset (0x0041)
 [OK] BMS restarted (comes back sealed).
 [OK] PF still clear 5 s after reset.
-[L] Seal (0x0030)
-[OK] Already sealed.
 [DONE] PF clear. Plug into the DJI charger and supervise the first charge.
 ```
 
-3. Keep holding the 9V until the `PF still clear 5 s after reset` line appears, then release it.
-4. Disconnect everything and put the battery on the **official DJI charger**. Alternating/chasing LEDs indicate it is charging again.
+The line to look for is **`PF still clear 5 s after reset`**. Go to Step 8.
 
-Normal behaviour that can look like an error:
-- A "NACK" or error on the very first unseal attempt is expected; it is a security feature of the chip.
-- The voltage shown during recovery may read high (~8.2V, the 9V feeding through) or may stay near the flat cell voltage; neither indicates a problem.
-- `PF still set. It may only update after reset (R)` after the P step: the sketch carries on to the reset and re-checks there. Judge by the line after the reset.
-- A second round (`PF still active after reset — second round...`) is normal; the chip comes back sealed after a reset, so it unseals and clears again.
-- `Already sealed` at the L step is expected, for the same reason.
+If instead you see **`PF RE-LATCHED within 5 s of reset`**, a cell is below the limit after all. Go to Step 7.
 
-## If PF re-latches after reset
+---
 
-If the output ends with `PF RE-LATCHED within 5 s of reset`, the unlock worked but the chip immediately found the same fault again: one of the cells is below its undervoltage threshold (measured by the dvdsosa project at about 2.2 V). No amount of clearing will hold until that cell rises, and the chip's charge path is disabled, so the DJI charger cannot raise it.
+## Step 7: Pump the cells up (the hard case)
 
-What is known to work, from [dvdsosa/dji-spark-battery-unbrick](https://github.com/dvdsosa/dji-spark-battery-unbrick), which recovered two packs with cells between 1.77 V and 2.2 V this way: during the 2–3 s between a reset and the re-latch, the chip precharges the cells from the wake-up supply (about 13 mA with a 12 V supply through 100 Ω). Repeating unseal → clear → reset ("pumping") lifts the lowest cell by 6–10 mV per round until it crosses the threshold, after which the chip stays in normal precharge on its own.
+When a cell is below about 2.2 V, the chip puts the flag back a few seconds after every clear. But in those few seconds it also lets a little charge from the 9V into the cells. Repeating clear-and-restart ("pumping") lifts the cells a bit each time until they are over the limit and the flag stays off. This is how two other people recovered packs with cells as low as 1.8 V. It is not a factory procedure.
 
-This sketch has that procedure built in as **`K`**. It reads the pack, asks you to type `y`, then runs rounds of unseal → clear → reset, waiting 5 s after each reset and printing one line per round with the three cell voltages, the lowest, the spread, the temperature and whether PF re-latched. It stops by itself when PF stays clear for 10 s (success), after 90 rounds, if the temperature passes 35 °C, if an unseal fails, if the chip stops answering, or when you press any key. On success it says so and re-seals the chip. Leave the 9V boost connected afterwards: the chip is now precharging the cells from it, and the `PCHG` marker on a `1` or `D` reading confirms that. Move to the DJI charger only once the lowest cell is well above 3.0 V. From 1.8 V expect 40 to 60 rounds, roughly 10 minutes, so use the hands-free boost rig from Step 4 and a fresh PP3. dvdsosa's read-only `monitor_charge.sh` also works with this sketch via the `D` command if you want a live display during the precharge.
+Type **`K`** and press Enter. It shows the cells, warns you, and waits for you to type **`y`**. Then it prints one line per round:
 
-**Field result, 7 October 2026 (pack serial 141, 22 cycles, 91% capacity).** First reading: cells 1843 / 1828 / 1999 mV, PF status SUV, Safety status CUV live. Pump with a PP3 9V directly on pins 3 and 2, no series resistor: lowest cell 2085 mV at pump start, PF re-latched after round 1 (2175 mV), stayed clear after round 2 (2243 mV). Two flash writes. Each round gave 70 to 90 mV, far more than dvdsosa's 6 to 10 mV with 12 V through 100 Ω. After the clear the chip reported SLEEP with both FETs off and no PCHG bit, yet the cells kept rising on the 9V alone: 2383 mV after a few minutes, 2525, 2663, with the spread closing from 157 to 42 mV. So "the BMS precharges by itself" may not show as PCHG on these packs; judge by `H` readings a few minutes apart. The passive rise on a PP3 was slow, about 100 mV per hour; the pack went to the DJI charger at 2.7 V per cell after four and a half hours rather than waiting for 3.0 V.
+```
+[K] round 1
+  cells 2190/2175/2332  min 2175  spread 157  22.1 C  PF LATCHED
+[K] round 2
+  cells 2258/2243/2393  min 2243  spread 150  22.1 C  PF clear
+[OK] PF stays clear after 2 round(s).
+```
 
-A second pack the same day (serial 1252, 20 cycles, 89%) had cells 2486 / 2502 / 2365 mV with PF = SUV but Safety status clean. That is the plain case: `A` cleared it on the first attempt and PF stayed clear after reset. No pumping needed when every cell is already above the trip threshold.
+It stops on its own when the flag stays off, or after 90 rounds, or if the pack warms past 35 °C, or if the connection drops. Press any key to stop it yourself. Stop if the pack feels warm, or if a cell's voltage goes **down** over several rounds.
 
-Before trying it, understand what it is: deliberately re-clearing a safety fault on deeply discharged lithium cells, dozens of times. Each re-latch is a write to the chip's flash, which has limited endurance. It is two people's reported successes, not a validated repair. Do it outdoors or on a fireproof surface, with a current-limited supply, watching the temperature, and treat a pack recovered this way as suspect for flight. A cell that has sat below 2.0 V may have grown copper dendrites and can fail during charge even if the numbers look fine afterwards.
+**After it succeeds, keep the 9V connected.** The cells carry on charging slowly from it, around 100 mV per hour. Press `H` now and then. Once the lowest cell is around 2.7 to 3.0 V, go to Step 8. On the first pack this took about four and a half hours; the DJI charger is much faster once it accepts the pack, so do not feel you must wait for 3.0 V.
 
-## Step 7: First charge (supervised)
+---
 
-**Charge promptly, and to completion.** A recovered pack that is left deeply discharged can set the Permanent Fail flag again within weeks, and the recovery has to be repeated. Recovery is not finished until the pack has completed a full charge; watch that the charger actually runs through to full rather than stalling partway.
+## Step 8: Charge it
 
-Charge the battery on a fireproof surface and check on it periodically. When full, insert it in the drone and check the reported battery health in the DJI app. If the battery drains abnormally fast or the app reports large cell-voltage differences, the cells are worn: use it as a bench/testing battery at most, and recycle it eventually.
+1. Press `1` once more. You want `PF active: no` and a normal temperature.
+2. Unclip the 9V and the data wires.
+3. Put the battery on the **official DJI charger**, on a fireproof surface. Stay with it for the first ten minutes and feel for warmth.
+4. Running lights mean it is charging. **Let it charge to full.** A pack left half-empty can set the flag again within weeks.
+5. If the lights blink an error pattern, the charger has refused it. Reconnect the Nano, press `1`, and check whether PF came back. If the cells are still low, give it more time on the 9V.
 
-**Built-in health check:** after the first full charge, reconnect the three wires (no 9V needed once the battery holds a charge) and press **`H`** in the Serial Monitor. It reads the battery's own records and prints the figures that indicate whether the cells are still trustworthy:
+**After the full charge**, reconnect the three data wires (no 9V needed now) and press `H`:
 
-- **Full-chg cap … % of new**: remaining capacity compared to when the pack was new. Below ~60–70%, expect very short flights.
-- **Cell spread**: the voltage difference between the individual cells. On a charged pack, more than ~100 mV of spread means the cells have aged unevenly; such a pack can cut out mid-flight and should not be flown.
-- **Cycle count / manufacture date**: how heavily the pack has been used.
+- **Full-chg cap … % of new**: under about 70% means very short flights.
+- **Cell spread**: over about 100 mV when full means the cells have aged unevenly. Such a pack can cut out in flight. Do not fly it.
+
+A pack whose cells were ever below 2.0 V is best kept as a bench or test battery even if these numbers look fine.
 
 ---
 
@@ -221,36 +197,38 @@ Charge the battery on a fireproof surface and check on it periodically. When ful
 
 | Problem | Fix |
 |---|---|
-| Serial Monitor shows nothing / garbage | Baud rate must be **115200** (dropdown at bottom of Serial Monitor) |
-| Upload fails (`stk500` errors) | Toggle **Tools → Processor** between **ATmega328P** and **ATmega328P (Old Bootloader)**; it must match the bootloader on your clone. Also check the Port menu. |
-| No port in the Port menu | A charge-only USB cable is the usual cause; swap for a data cable. Otherwise install the CH340 driver. |
-| `Nothing found!` when pressing `S` | First unplug the battery and press `W`: a failed pull-up explains it on its own. If `W` passes, the chip has no power (do the 9V boost while scanning) or the battery-end wiring is wrong: Pin 6→A4, Pin 1→A5, Pin 2→GND, and the 9V negative on the same ground rail as the Nano |
-| `READ ERROR` on voltage | Same causes as above |
-| `Chip is sealed — run U first` | Press `U`, then `P`. If `U` fails five times, check contacts (`T`) and the 9V boost |
-| `OpStatus : unreadable` | The chip is not answering the status subcommands. Usually a contact problem: run `T` and re-seat the pins |
-| `PF RE-LATCHED within 5 s of reset` | A cell is below ~2.2 V (check `H`). See [If PF re-latches after reset](#if-pf-re-latches-after-reset) |
-| Recovery ran but battery still won't charge | Press `1`: if `PF active: no` and `Charge: disabled (XCHG)` is gone, the problem is on the charger side; otherwise press `A` again with the 9V boost held the whole time |
-| LEDs never blink during 9V boost | Check the 9V battery is fresh; check +→Pin 3, −→Pin 2; hold firmly (the pins are small) |
+| Serial Monitor shows nothing or garbage | Speed must be 115200 |
+| Upload fails with `stk500` errors | Change Tools → Processor to the other ATmega328P option |
+| No port appears | The USB cable is charge-only. Swap it. Otherwise install the CH340 driver |
+| `W` says FAIL | That resistor is missing, in the wrong row, or on the dead half of the rail |
+| `S` says `Nothing found!` | Unplug the battery and press `W` first. If `W` passes: 9V not connected or flat, pins 1 and 6 swapped, pin 2 not on the same ground as the Nano |
+| `T` shows errors | A pin is not gripping. Bend the tips, re-seat, tape down |
+| `OpStatus : unreadable` | Same as above: the chip is not answering properly |
+| `Chip is sealed — run U first` | Press `U`, then `P` |
+| `PF RE-LATCHED within 5 s of reset` | A cell is under 2.2 V. Step 7 |
+| Pack lights never blink with 9V on | Check the 9V with a meter across Spark pins 3 and 2. Check red is on pin 3, black on pin 2 |
+| Charger refuses the pack after recovery | Press `1`. If PF is back, the cells were too low: Step 7. If PF is clear, try the charger again after more time on the 9V |
 
 ---
 
-## Menu reference (for step-by-step use)
+## Menu
 
-| Key | Action |
-|---|---|
-| `1` | Read battery status: voltage, temperature, fault flags. Useful for before/after comparison |
-| `H` | Battery health report: serial number, age, cycle count, remaining capacity, per-cell voltages |
-| `S` | Scan for the chip; should find address `0x0B` |
-| `T` | Bus stress test: 300 rapid reads with an error count. Run before recovery if working without pull-up resistors; proceed only on 0 errors |
-| `D` | One CSV line of pack/cell voltages, current, temperature and status words. Read-only; for monitor scripts |
-| `U` | Unseal (authenticate to) the chip with the DJI key, five attempts, verified by reading the security level |
-| `F` | Full Access with the TI default key. Not needed for a PF clear; included for completeness |
-| `P` | PermanentFailDataReset (0x0029), up to five attempts, PF status re-read after each |
-| `R` | Restart the chip, then wait 5 s and report whether PF came back |
-| `L` | Re-seal the chip |
-| `A` | All of the above, in order: the normal recovery path |
-| `K` | Pump: repeat `A` while PF re-latches, for packs with a cell below ~2.2 V. Asks for confirmation; stops on success, 90 rounds, 35 °C, lost contact or a key press. See [If PF re-latches after reset](#if-pf-re-latches-after-reset) |
+| Key | Does | Changes the battery? |
+|---|---|---|
+| `1` | Status: security, PF flag, faults, temperature | no |
+| `H` | Health: cells, capacity, serial, age | no |
+| `S` | Find the chip | no |
+| `W` | Test the breadboard wiring, no battery needed | no |
+| `T` | Connection stability test, 300 reads | no |
+| `D` | One line of numbers for monitor scripts | no |
+| `U` | Unseal the chip | yes |
+| `F` | Full access. Not needed | yes |
+| `P` | Clear the PF flag | yes |
+| `R` | Restart the chip, then check the flag stays off | yes |
+| `L` | Seal the chip again | yes |
+| `A` | The normal recovery: U, P, R, L | yes |
+| `K` | Pump: repeat A until the flag stays off | yes |
 
 ---
 
-*Ported from the ESP32 original by [Lishen99](https://github.com/Lishen99/DJI-Spark-Battery-Recovery-ESP32) (MIT licence). The unseal key and command sequence come from the [dji-firmware-tools](https://github.com/o-gs/dji-firmware-tools) community. The health-report idea comes from [davext/unbrick-dji](https://github.com/davext/unbrick-dji).*
+*Based on the ESP32 version by [Lishen99](https://github.com/Lishen99/DJI-Spark-Battery-Recovery-ESP32) (MIT). The unseal key comes from the [dji-firmware-tools](https://github.com/o-gs/dji-firmware-tools/issues/258) community. The pumping method and protocol corrections come from [dvdsosa/dji-spark-battery-unbrick](https://github.com/dvdsosa/dji-spark-battery-unbrick). The health screen idea is from [davext/unbrick-dji](https://github.com/davext/unbrick-dji).*
