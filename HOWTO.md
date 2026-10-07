@@ -131,10 +131,26 @@ Before changing anything on the battery, confirm communication works using comma
 
 1. If the battery is dead, hold the 9V boost (Step 4) during each check below.
 2. Press **`S`** (scan). Expect: `0x0B <- DJI BMS`. This proves the wiring and pull-ups work.
-3. Press **`1`** (status). Expect: a plausible pack voltage, a temperature, and a `Batt flags` line. On a locked battery the flags typically include `StopChargeAlarm` and `StopDischargeAlarm` even though the pack is empty; that combination confirms the diagnosis. The screen can also show `Seal state`, `Safety status`, and `PF status` lines, but on many DJI packs those reads fail through the register path this sketch uses (ManufacturerBlockAccess, 0x44) and the lines never print, in any state. That is normal and does not block recovery; the clear commands still work.
-4. Press **`H`** (health). Expect: serial number, cycle count, capacity figures. Worth recording as a "before" snapshot.
+3. Press **`1`** (status). Expect: a plausible pack voltage, a temperature, a `Batt flags` line, and then the chip's own view of its state. On a locked battery a typical readout is:
 
-Only move on to Step 6 once all three respond sensibly. If they do not, go back over Step 2 and the troubleshooting table; no command in this step can have changed anything.
+```
+Batt flags   : 0x48C0  StopChargeAlarm  StopDischargeAlarm  Discharging
+Device type  : 0x4307  (BQ9003/BQ40Z307 - OK)
+OpStatus     : 0x00007300
+  Security   : Sealed
+  PF active  : YES  <- locked
+  Charge     : disabled (XCHG)
+  Discharge  : disabled (XDSG)
+Safety status: 0x00000001  <- FAULTS ACTIVE
+  -> CUV: cell under-voltage
+PF status    : 0x00000001  <- PERMANENT FAIL (needs clearing)
+  -> SUV: cell under-voltage PF (deep discharge)
+```
+
+   `Security: Sealed` plus `PF active: YES` is the expected starting point. If `OpStatus` says `unreadable`, the chip is not answering properly; fix the connection before going on.
+4. Press **`H`** (health). Expect: serial number, cycle count, capacity figures and **per-cell voltages**. Write down the lowest cell. Below about **2.2 V** the chip will set PF again within seconds of any clear, and the health screen says so. Below **2.0 V** the cell may be damaged.
+
+Only move on to Step 6 once all three respond sensibly and the lowest cell is known. If they do not, go back over Step 2 and the troubleshooting table; no command in this step can have changed anything.
 
 > **No resistors yet?** This step can still be attempted: the Nano has weak built-in pull-ups, and over short wires (≤15 cm) reading often works with those alone. Two caveats: a failure proves nothing (it is probably the missing resistors, not the wiring), and do not run Step 6 until the real resistors are fitted. Reads on a marginal bus are harmless; writes are not worth the risk.
 
@@ -145,26 +161,37 @@ Only move on to Step 6 once all three respond sensibly. If they do not, go back 
 
 ```
 [*] Pack voltage before: 8222 mV
-[U] Trying DJI Spark key (0x7EE0/0xCCDF = 0xCCDF7EE0, low word first)...
-[OK] Unsealed with Spark key! State: Unsealed
-[P] Sending PF clear commands (timeouts = chip processing, that's OK):
-[P]   0x002A -> reg 0x44 : ACK
-[P]   0x002B -> reg 0x44 : ACK
-[P]   0x0029 -> reg 0x00 : ACK
-[R] Sending chip reset...
-[OK] BMS restarted. Voltage: 8226 mV
-[DONE] Now plug into the DJI charger.
+[*] Lowest cell: 2710 mV
+[U] Unseal
+[U]   Spark key 0xCCDF7EE0 attempt 1 -> Unsealed
+[P] PermanentFailDataReset (0x0029)
+[P]   attempt 1 ACK  PF status 0x00000000  (cleared)
+[OK] PF cleared.
+[R] DeviceReset (0x0041)
+[OK] BMS restarted (comes back sealed).
+[OK] PF still clear 5 s after reset.
+[L] Seal (0x0030)
+[OK] Already sealed.
+[DONE] PF clear. Plug into the DJI charger and supervise the first charge.
 ```
 
-3. Keep holding the 9V until the `[R] ... BMS restarted` line appears, then release it.
+3. Keep holding the 9V until the `PF still clear 5 s after reset` line appears, then release it.
 4. Disconnect everything and put the battery on the **official DJI charger**. Alternating/chasing LEDs indicate it is charging again.
 
 Normal behaviour that can look like an error:
 - A "NACK" or error on the very first unseal attempt is expected; it is a security feature of the chip.
 - The voltage shown during recovery may read high (~8.2V, the 9V feeding through) or may stay near the flat cell voltage; neither indicates a problem.
-- `PF status unreadable after commands` is normal on packs whose firmware blocks that read (see Step 5). Judge success by the `Batt flags` line instead: after a successful clear the `StopChargeAlarm`/`StopDischargeAlarm` bits disappear, and the charger accepts the pack.
-- "Not sealed" at the very end is harmless; the chip re-locks itself on restart.
-- "Unsealed only (may need FA)" is fine; the PF clear works from the Unsealed state.
+- `PF still set. It may only update after reset (R)` after the P step: the sketch carries on to the reset and re-checks there. Judge by the line after the reset.
+- A second round (`PF still active after reset — second round...`) is normal; the chip comes back sealed after a reset, so it unseals and clears again.
+- `Already sealed` at the L step is expected, for the same reason.
+
+## If PF re-latches after reset
+
+If the output ends with `PF RE-LATCHED within 5 s of reset`, the unlock worked but the chip immediately found the same fault again: one of the cells is below its undervoltage threshold (measured by the dvdsosa project at about 2.2 V). No amount of clearing will hold until that cell rises, and the chip's charge path is disabled, so the DJI charger cannot raise it.
+
+What is known to work, from [dvdsosa/dji-spark-battery-unbrick](https://github.com/dvdsosa/dji-spark-battery-unbrick), which recovered two packs with cells between 1.77 V and 2.2 V this way: during the 2–3 s between a reset and the re-latch, the chip precharges the cells from the wake-up supply (about 13 mA with a 12 V supply through 100 Ω). Repeating unseal → clear → reset ("pumping") lifts the lowest cell by 6–10 mV per round until it crosses the threshold, after which the chip stays in normal precharge on its own. Their `pf_pump.sh` automates this against their sketch; their `monitor_charge.sh` (read-only) works with this sketch too, via the `D` command.
+
+Before trying it, understand what it is: deliberately re-clearing a safety fault on deeply discharged lithium cells, dozens of times. Each re-latch is a write to the chip's flash, which has limited endurance. It is two people's reported successes, not a validated repair. Do it outdoors or on a fireproof surface, with a current-limited supply, watching the temperature, and treat a pack recovered this way as suspect for flight. A cell that has sat below 2.0 V may have grown copper dendrites and can fail during charge even if the numbers look fine afterwards.
 
 ## Step 7: First charge (supervised)
 
@@ -189,9 +216,10 @@ Charge the battery on a fireproof surface and check on it periodically. When ful
 | No port in the Port menu | A charge-only USB cable is the usual cause; swap for a data cable. Otherwise install the CH340 driver. |
 | `Nothing found!` when pressing `S` | Chip has no power: do the 9V boost while scanning. Also re-check: Pin 6→A4, Pin 1→A5, Pin 2→GND, both resistors in place |
 | `READ ERROR` on voltage | Same causes as above |
-| All PF commands say NACK | Chip did not unseal: press `U` first, then `P`. If `U` fails repeatedly, check wiring |
-| Recovery ran but battery still won't charge | Press `A` again (some batteries need two rounds), and hold the 9V boost the whole time |
-| `Seal state` / `Safety status` / `PF status` lines never print | Normal on many DJI packs: the firmware refuses those reads even after unsealing. Diagnose from the `Batt flags` line; verify recovery with the charger |
+| `Chip is sealed — run U first` | Press `U`, then `P`. If `U` fails five times, check contacts (`T`) and the 9V boost |
+| `OpStatus : unreadable` | The chip is not answering the status subcommands. Usually a contact problem: run `T` and re-seat the pins |
+| `PF RE-LATCHED within 5 s of reset` | A cell is below ~2.2 V (check `H`). See [If PF re-latches after reset](#if-pf-re-latches-after-reset) |
+| Recovery ran but battery still won't charge | Press `1`: if `PF active: no` and `Charge: disabled (XCHG)` is gone, the problem is on the charger side; otherwise press `A` again with the 9V boost held the whole time |
 | LEDs never blink during 9V boost | Check the 9V battery is fresh; check +→Pin 3, −→Pin 2; hold firmly (the pins are small) |
 
 ---
@@ -204,9 +232,11 @@ Charge the battery on a fireproof surface and check on it periodically. When ful
 | `H` | Battery health report: serial number, age, cycle count, remaining capacity, per-cell voltages |
 | `S` | Scan for the chip; should find address `0x0B` |
 | `T` | Bus stress test: 300 rapid reads with an error count. Run before recovery if working without pull-up resistors; proceed only on 0 errors |
-| `U` | Unseal (authenticate to) the chip with the DJI key |
-| `P` | Clear the Permanent Fail flags (all of them) |
-| `R` | Restart the chip |
+| `D` | One CSV line of pack/cell voltages, current, temperature and status words. Read-only; for monitor scripts |
+| `U` | Unseal (authenticate to) the chip with the DJI key, five attempts, verified by reading the security level |
+| `F` | Full Access with the TI default key. Not needed for a PF clear; included for completeness |
+| `P` | PermanentFailDataReset (0x0029), up to five attempts, PF status re-read after each |
+| `R` | Restart the chip, then wait 5 s and report whether PF came back |
 | `L` | Re-seal the chip |
 | `A` | All of the above, in order: the normal recovery path |
 

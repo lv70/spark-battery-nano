@@ -35,12 +35,24 @@
  *  3. Immediately run option A (auto recover) or step through U/P/R/L.
  *  4. Keep the 9 V held until the Reset step completes.
  *
- * ── Recovery steps (mirrors DJI Battery Killer software) ─────────────────
+ * ── Recovery steps ────────────────────────────────────────────────────────
  *  U → Unseal
- *  P → Clear PF  (sends all three PF-clear commands)
- *  R → Reset chip
+ *  P → Clear PF  (PermanentFailDataReset 0x0029, verified, up to 5 tries)
+ *  R → Reset chip (then re-checks PF a few seconds later: if it re-latches,
+ *                  a cell is still below the undervoltage threshold)
  *  L → Seal (re-lock)
- *  A → All of the above automatically
+ *  A → All of the above automatically (second round if PF survives reset)
+ *
+ * ── Protocol notes (TI bq40z50-R2 TRM SLUUBK0, which the Z307 follows) ───
+ *  Status subcommands are written to ManufacturerAccess (0x00) and the reply
+ *  is block-read from ManufacturerData (0x23).  That works even when sealed.
+ *  DJI packs refuse the ManufacturerBlockAccess (0x44) path this sketch used
+ *  before, which is why the Seal/Safety/PF lines never printed.
+ *  OperationStatus (0x0054, 32-bit): SEC1:SEC0 = bits 9:8
+ *    (1 = Full Access, 2 = Unsealed, 3 = Sealed), PF = bit 12,
+ *    XDSG = 13, XCHG = 14, PCHG = 3, CHG = 2, DSG = 1.
+ *  0x002A is BlackBoxRecorderReset and 0x002B toggles the LEDs — neither is
+ *  a PF clear; earlier versions sent them as such.
  */
 
 #include <Wire.h>
@@ -53,7 +65,7 @@
 #define R_CURRENT   0x0A
 #define R_RSOC      0x0D   // Relative State of Charge (%)
 #define R_STATUS    0x16   // BatteryStatus flags (0x16 per SBS spec; upstream had 0x19 = DesignVoltage)
-#define R_MAC       0x44   // ManufacturerBlockAccess (BQ40Z307 gateway)
+#define R_MAC_DATA  0x23   // ManufacturerData: block reply to a 0x00 subcommand
 
 // ── Health / info registers (standard SBS unless noted) ──────────────────
 #define R_FCC        0x10  // FullChargeCapacity (mAh) — what the pack holds NOW
@@ -79,10 +91,20 @@
 #define MAC_PF_ALERT       0x0052
 #define MAC_PF_STATUS      0x0053
 #define MAC_OP_STATUS      0x0054
-#define MAC_PF_CLEAR       0x002A   // Clear PF flag 1
-#define MAC_PF2_CLEAR      0x002B   // Clear PF flag 2
-#define MAC_RESET          0x0041   // Soft reset
-#define MAC_SEAL           0x0030   // Re-seal device
+#define MAC_RESET          0x0041   // DeviceReset
+#define MAC_SEAL           0x0030   // Seal
+
+// OperationStatus bits (32-bit value)
+#define OP_DSG       (1UL << 1)
+#define OP_CHG       (1UL << 2)
+#define OP_PCHG      (1UL << 3)
+#define OP_SEC_SHIFT 8               // SEC1:SEC0
+#define OP_PF        (1UL << 12)
+#define OP_XDSG      (1UL << 13)
+#define OP_XCHG      (1UL << 14)
+#define SEC_FULL     1
+#define SEC_UNSEALED 2
+#define SEC_SEALED   3
 
 // DJI Spark confirmed key: 0xCCDF7EE0 — LOW word written first, then HIGH word.
 // First key write always NACKs — that is a security feature of the chip, not an error.
@@ -95,7 +117,12 @@
 #define KEY_FULL_1         0xFFFF
 #define KEY_FULL_2         0xFFFF
 
-// PermanentFailDataReset: clears ALL PF flags — goes to reg 0x00, not 0x44
+struct KeyPair { uint16_t w0, w1; };
+const KeyPair KEY_SPARK   = { KEY_SPARK_1,  KEY_SPARK_2  };
+const KeyPair KEY_TI_UNS  = { KEY_UNSEAL_1, KEY_UNSEAL_2 };
+const KeyPair KEY_TI_FULL = { KEY_FULL_1,   KEY_FULL_2   };
+
+// PermanentFailDataReset: the only PF-clear subcommand. Written to reg 0x00.
 #define MAC_PF_DATA_RESET  0x0029
 
 // ── Bus timeout handling ──────────────────────────────────────────────────
@@ -130,14 +157,6 @@ void printHex32(uint32_t v) {
 
 // ── Low-level helpers ─────────────────────────────────────────────────────
 
-bool writeWord(uint8_t reg, uint16_t val) {
-    Wire.beginTransmission(BATT_ADDR);
-    Wire.write(reg);
-    Wire.write((uint8_t)(val & 0xFF));
-    Wire.write((uint8_t)(val >> 8));
-    return Wire.endTransmission() == 0;
-}
-
 int32_t readWord(uint8_t reg) {
     Wire.beginTransmission(BATT_ADDR);
     Wire.write(reg);
@@ -159,65 +178,89 @@ uint8_t mac00Write(uint16_t subcmd) {
     return Wire.endTransmission();
 }
 
-// Write 2-byte MAC subcommand to register 0x44 (ManufacturerBlockAccess)
-// Used for: PF clear, status reads — only accessible after unsealing
-uint8_t macSend(uint16_t subcmd) {
-    Wire.beginTransmission(BATT_ADDR);
-    Wire.write(R_MAC);
-    Wire.write((uint8_t)(subcmd & 0xFF));
-    Wire.write((uint8_t)(subcmd >> 8));
-    return Wire.endTransmission();
-}
-
 const __FlashStringHelper* busResultStr(uint8_t code) {
     if (code == 0) return F("ACK");
     if (code == 5) return F("TIMEOUT (chip busy — usually OK)");
     return F("NACK");
 }
 
-// Block-read response from register 0x44 (first byte = byte count)
-// Uses stop+start instead of repeated-start — some BMS chips need this.
+// SMBus block read: [count][data...]. Returns byte count, or 0 on failure.
 // AVR Wire buffer is 32 bytes, so never request more than that.
-uint8_t macRead(uint8_t* buf, uint8_t maxLen) {
+uint8_t readBlock(uint8_t reg, uint8_t* buf, uint8_t maxLen) {
     Wire.beginTransmission(BATT_ADDR);
-    Wire.write(R_MAC);
-    if (Wire.endTransmission(true) != 0) return 0;  // STOP, then new START below
-    delay(5);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return 0;   // repeated start
     uint8_t req = maxLen + 1;
-    if (req > 32) req = 32;                  // AVR Wire hard limit
-    Wire.requestFrom((uint8_t)BATT_ADDR, req);
-    if (!Wire.available()) return 0;
+    if (req > 32) req = 32;
+    if (Wire.requestFrom((uint8_t)BATT_ADDR, req) == 0) return 0;
     uint8_t len = Wire.read();               // byte-count prefix
-    len = min(len, (uint8_t)(req - 1));
-    for (uint8_t i = 0; i < len && Wire.available(); i++) buf[i] = Wire.read();
+    if (len > req - 1) len = req - 1;
+    for (uint8_t i = 0; i < len; i++) buf[i] = Wire.available() ? Wire.read() : 0;
     while (Wire.available()) Wire.read();    // flush remainder
     return len;
 }
 
-// Send command, wait, read response
+// Subcommand to ManufacturerAccess (0x00), reply from ManufacturerData (0x23).
+// Works on a sealed chip for the status subcommands. Retries: the Spark
+// connector contacts are unreliable.
 uint8_t macCmd(uint16_t subcmd, uint8_t* buf, uint8_t maxLen) {
-    if (macSend(subcmd) != 0) return 0;
-    delay(20);
-    return macRead(buf, maxLen);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (mac00Write(subcmd) == 0) {
+            delay(5);
+            uint8_t n = readBlock(R_MAC_DATA, buf, maxLen);
+            if (n > 0) return n;
+        }
+        delay(10);
+    }
+    return 0;
+}
+
+// 32-bit status word (OperationStatus, SafetyStatus, PFStatus ...)
+bool macRead32(uint16_t subcmd, uint32_t& out) {
+    uint8_t b[4] = {0};
+    uint8_t n = macCmd(subcmd, b, 4);
+    if (n < 2) return false;
+    out = (uint32_t)b[0] | ((uint32_t)b[1] << 8)
+        | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return true;
+}
+
+// Security level from OperationStatus: SEC_FULL/UNSEALED/SEALED, 0 = unreadable
+uint8_t readSec(uint32_t* opOut = NULL) {
+    uint32_t op;
+    if (!macRead32(MAC_OP_STATUS, op)) return 0;
+    if (opOut) *opOut = op;
+    return (op >> OP_SEC_SHIFT) & 0x03;
+}
+
+const __FlashStringHelper* secName(uint8_t sec) {
+    if (sec == SEC_FULL)     return F("Full Access");
+    if (sec == SEC_UNSEALED) return F("Unsealed");
+    if (sec == SEC_SEALED)   return F("Sealed");
+    return F("unreadable");
+}
+
+// PF is active if the OperationStatus PF bit or any PFStatus bit is set
+bool pfActive(uint32_t* pfsOut = NULL) {
+    uint32_t op = 0, pfs = 0;
+    readSec(&op);
+    macRead32(MAC_PF_STATUS, pfs);
+    if (pfsOut) *pfsOut = pfs;
+    return (op & OP_PF) || pfs;
+}
+
+bool present() {
+    Wire.beginTransmission(BATT_ADDR);
+    return Wire.endTransmission() == 0;
 }
 
 // SMBus block-read of a string register (first byte = length, then ASCII)
 void printSBSString(uint8_t reg) {
-    Wire.beginTransmission(BATT_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(true) != 0) { Serial.println(F("(no reply)")); return; }
-    delay(5);
-    if (!Wire.requestFrom((uint8_t)BATT_ADDR, (uint8_t)32)) {  // AVR Wire max
-        Serial.println(F("(no reply)"));
-        return;
-    }
-    uint8_t len = Wire.read();
-    if (len > 31) len = 31;
-    for (uint8_t i = 0; i < len && Wire.available(); i++) {
-        char ch = (char)Wire.read();
-        if (ch >= 32 && ch < 127) Serial.print(ch);   // printable ASCII only
-    }
-    while (Wire.available()) Wire.read();             // flush remainder
+    uint8_t b[31];
+    uint8_t n = readBlock(reg, b, sizeof(b));
+    if (!n) { Serial.println(F("(no reply)")); return; }
+    for (uint8_t i = 0; i < n; i++)
+        if (b[i] >= 32 && b[i] < 127) Serial.write(b[i]);   // printable ASCII only
     Serial.println();
 }
 
@@ -291,6 +334,14 @@ void printHealth() {
         Serial.print(F("Cell spread  : "));
         Serial.print(vmax - vmin);
         Serial.println(F(" mV  (>100 mV when charged = worn/unsafe cells)"));
+        if (vmin < 2200) {
+            Serial.print(F("  !! Lowest cell "));
+            Serial.print(vmin);
+            Serial.println(F(" mV is below the ~2.2 V undervoltage threshold:"));
+            Serial.println(F("     PF will re-latch 2-3 s after every clear until it rises."));
+        }
+        if (vmin < 2000)
+            Serial.println(F("  !! Cell < 2.0 V: possible internal damage. Supervise or discard."));
     }
 
     Serial.println(F("------------------------------------\n"));
@@ -347,211 +398,195 @@ void printStatus() {
         Serial.println();
     }
 
-    uint8_t buf[30] = {0};
+    uint8_t buf[4] = {0};
 
     // Device type
-    uint8_t n = macCmd(MAC_DEV_TYPE, buf, sizeof(buf));
-    if (n >= 4) {
-        uint16_t id = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+    uint8_t n = macCmd(MAC_DEV_TYPE, buf, 2);
+    if (n >= 2) {
+        uint16_t id = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
         Serial.print(F("Device type  : "));
         printHex16(id);
         if (id == 0x4307 || id == 0xFA02) Serial.print(F("  (BQ9003/BQ40Z307 - OK)"));
         Serial.println();
     }
 
-    // Seal state from OperationStatus
-    n = macCmd(MAC_OP_STATUS, buf, sizeof(buf));
-    if (n >= 1) {
-        uint8_t sec = (buf[0] >> 1) & 0x03;
-        Serial.print(F("Seal state   : "));
-        if      (sec == 0) Serial.println(F("Full Access"));
-        else if (sec == 1) Serial.println(F("Unsealed"));
-        else if (sec == 3) Serial.println(F("Sealed"));
-        else               Serial.println(F("?"));
-        if (buf[0] & 0x08) Serial.println(F("  CHG FET ON"));
-        if (buf[0] & 0x10) Serial.println(F("  DSG FET ON"));
+    // OperationStatus: security level, PF bit, FET state
+    uint32_t op;
+    uint8_t sec = readSec(&op);
+    if (sec) {
+        Serial.print(F("OpStatus     : ")); printHex32(op); Serial.println();
+        Serial.print(F("  Security   : ")); Serial.println(secName(sec));
+        Serial.print(F("  PF active  : ")); Serial.println((op & OP_PF) ? F("YES  <- locked") : F("no"));
+        Serial.print(F("  Charge     : "));
+        Serial.println((op & OP_XCHG) ? F("disabled (XCHG)")
+                     : (op & OP_PCHG) ? F("PRECHARGE on")
+                     : (op & OP_CHG)  ? F("FET on") : F("FET off"));
+        Serial.print(F("  Discharge  : "));
+        Serial.println((op & OP_XDSG) ? F("disabled (XDSG)")
+                     : (op & OP_DSG)  ? F("FET on") : F("FET off"));
+    } else {
+        Serial.println(F("OpStatus     : unreadable"));
     }
 
-    // Safety status (latched faults)
-    n = macCmd(MAC_SAFETY_STATUS, buf, sizeof(buf));
-    if (n >= 2) {
-        uint16_t ss = buf[0] | ((uint16_t)buf[1] << 8);
+    // Safety status (live faults). TRM bit map: 0 CUV, 1 COV, 2-3 OCC, 4-5 OCD
+    uint32_t ss;
+    if (macRead32(MAC_SAFETY_STATUS, ss)) {
         Serial.print(F("Safety status: "));
-        printHex16(ss);
-        Serial.println(ss ? F("  <- FAULTS LATCHED") : F("  OK"));
-        if (ss & 0x0001) Serial.println(F("  -> CUV: cell under-voltage latched"));
-        if (ss & 0x0008) Serial.println(F("  -> COV: cell over-voltage latched"));
-        if (ss & 0x0010) Serial.println(F("  -> OCC: overcurrent charge"));
-        if (ss & 0x0020) Serial.println(F("  -> OCD: overcurrent discharge"));
+        printHex32(ss);
+        Serial.println(ss ? F("  <- FAULTS ACTIVE") : F("  OK"));
+        if (ss & 0x01) Serial.println(F("  -> CUV: cell under-voltage"));
+        if (ss & 0x02) Serial.println(F("  -> COV: cell over-voltage"));
+        if (ss & 0x0C) Serial.println(F("  -> OCC: overcurrent charge"));
+        if (ss & 0x30) Serial.println(F("  -> OCD: overcurrent discharge"));
     }
 
-    // Permanent Fail status
-    n = macCmd(MAC_PF_STATUS, buf, sizeof(buf));
-    if (n >= 4) {
-        uint32_t pf = (uint32_t)buf[0] | ((uint32_t)buf[1]<<8)
-                    | ((uint32_t)buf[2]<<16) | ((uint32_t)buf[3]<<24);
+    // Permanent Fail status. Bit 0 = SUV (safety cell undervoltage PF)
+    uint32_t pf;
+    if (macRead32(MAC_PF_STATUS, pf)) {
         Serial.print(F("PF status    : "));
         printHex32(pf);
         Serial.println(pf ? F("  <- PERMANENT FAIL (needs clearing)") : F("  OK"));
+        if (pf & 0x01) Serial.println(F("  -> SUV: cell under-voltage PF (deep discharge)"));
     }
 
     Serial.println(F("------------------------------------\n"));
 }
 
+// One CSV line, read-only. Same format as dvdsosa/dji-spark-battery-unbrick
+// so its monitor_charge.sh works with this sketch:
+// D,pack_mV,c1_mV,c2_mV,c3_mV,current_mA,temp_dC,OperationStatus,PFStatus
+// Unreadable fields are -1 (status words as 4294967295).
+void printDump() {
+    int32_t pack = readWord(R_VOLTAGE);
+    int32_t c1 = readWord(R_CELL1), c2 = readWord(R_CELL2), c3 = readWord(R_CELL3);
+    int32_t cur = readWord(R_CURRENT);
+    int32_t tk  = readWord(R_TEMP);
+    uint32_t op = 0xFFFFFFFFUL, pfs = 0xFFFFFFFFUL;
+    if (!macRead32(MAC_OP_STATUS, op))  op  = 0xFFFFFFFFUL;
+    if (!macRead32(MAC_PF_STATUS, pfs)) pfs = 0xFFFFFFFFUL;
+    Serial.print(F("D,"));
+    Serial.print(pack); Serial.print(',');
+    Serial.print(c1);   Serial.print(',');
+    Serial.print(c2);   Serial.print(',');
+    Serial.print(c3);   Serial.print(',');
+    Serial.print(cur < 0 ? -1 : (int16_t)cur); Serial.print(',');
+    Serial.print(tk  < 0 ? -1 : tk - 2731);    Serial.print(',');
+    Serial.print(op);   Serial.print(',');
+    Serial.println(pfs);
+}
+
 // ── Recovery operations ───────────────────────────────────────────────────
 
-// Check seal state by probing 0x44 — sealed chips NACK writes to 0x44
-// sec: 3 = sealed, 1 = unsealed, 0 = full access (we treat 0 and 1 the same here)
-bool readSealState(uint8_t& sec) {
-    Wire.beginTransmission(BATT_ADDR);
-    Wire.write(R_MAC);
-    Wire.write((uint8_t)0x01); Wire.write((uint8_t)0x00);   // MAC_DEV_TYPE probe
-    bool acked = (Wire.endTransmission() == 0);
-    delay(10);
-    if (!acked) { sec = 3; return true; } // NACK = still sealed
-
-    // ACK means 0x44 is accessible — try reading OperationStatus for detail
-    uint8_t buf[8] = {0};
-    uint8_t n = macCmd(MAC_OP_STATUS, buf, sizeof(buf));
-    sec = (n >= 1) ? ((buf[0] >> 1) & 0x03) : 1;
-    return true;
+// Both key halves back to back (the chip needs them within 4 s). A NACK on a
+// word is not conclusive — the result is verified by reading OperationStatus.
+void sendKey(const KeyPair& k) {
+    mac00Write(k.w0); delay(2);
+    mac00Write(k.w1); delay(50);
 }
 
-void printSealName(uint8_t sec) {
-    if      (sec == 0) Serial.print(F("Full Access"));
-    else if (sec == 1) Serial.print(F("Unsealed"));
-    else if (sec == 3) Serial.print(F("Sealed"));
-    else               Serial.print(F("?"));
+// Try a key up to 5 times until the security level is <= target
+bool tryKey(const KeyPair& k, uint8_t target, const __FlashStringHelper* label) {
+    for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+        sendKey(k);
+        uint8_t sec = readSec();
+        Serial.print(F("[U]   ")); Serial.print(label);
+        Serial.print(F(" attempt ")); Serial.print(attempt);
+        Serial.print(F(" -> ")); Serial.println(secName(sec));
+        if (sec != 0 && sec <= target) return true;
+        delay(300);
+    }
+    return false;
 }
 
-void doUnseal() {
-    // DJI Spark confirmed unseal key: 0xCCDF7EE0, low word first
-    // Source: dji-firmware-tools GitHub issue #258 (multiple independent confirmations)
-    Serial.println(F("[U] Trying DJI Spark key (0x7EE0/0xCCDF = 0xCCDF7EE0, low word first)..."));
-    mac00Write(KEY_SPARK_1); delay(15);
-    mac00Write(KEY_SPARK_2); delay(150);
-
-    uint8_t sec = 3;
-    readSealState(sec);
-    if (sec != 3) {
-        Serial.print(F("[OK] Unsealed with Spark key! State: "));
-        printSealName(sec);
-        Serial.println();
-        if (sec != 0) {
-            // Write Spark key pair a second time to escalate to Full Access.
-            // DJI Spark appears to use the same key for both Unseal and Full Access.
-            Serial.println(F("[U] Re-applying Spark key for Full Access..."));
-            mac00Write(KEY_SPARK_1); delay(15);
-            mac00Write(KEY_SPARK_2); delay(150);
-            readSealState(sec);
-            Serial.print(sec == 0 ? F("[OK] State: ") : F("[!] State: "));
-            if (sec == 0) Serial.println(F("Full Access"));
-            else          Serial.println(F("Unsealed only (PF clear will proceed; may need FA)"));
-        }
-        return;
+bool doUnseal() {
+    Serial.println(F("[U] Unseal"));
+    uint8_t sec = readSec();
+    if (sec == 0) {
+        Serial.println(F("[!] OperationStatus unreadable — check wiring/boost, then retry."));
+        return false;
     }
-
-    // Fallback: standard TI defaults
-    Serial.println(F("[U] Spark key failed — trying TI defaults (0x0414/0x3672)..."));
-    mac00Write(KEY_UNSEAL_1); delay(15);
-    mac00Write(KEY_UNSEAL_2); delay(150);
-    readSealState(sec);
-    if (sec == 3) {
-        Serial.println(F("[!] Still sealed after both key attempts."));
-        Serial.println(F("    Check wiring, then retry with the 9V boost held."));
-        return;
-    }
-    Serial.print(F("[OK] Unsealed with TI keys! State: "));
-    printSealName(sec);
-    Serial.println();
-
-    if (sec != 0) {
-        // Try FA escalation with TI defaults
-        Serial.println(F("[U] Trying Full Access escalation (0xFFFF/0xFFFF)..."));
-        mac00Write(KEY_FULL_1); delay(15);
-        mac00Write(KEY_FULL_2); delay(150);
-        readSealState(sec);
-        Serial.print(sec == 0 ? F("[OK] State now: ") : F("[!] State now: "));
-        if (sec == 0) Serial.println(F("Full Access"));
-        else          Serial.println(F("Unsealed (no FA key worked)"));
-    }
+    if (sec != SEC_SEALED) { Serial.println(F("[OK] Already unsealed.")); return true; }
+    // DJI Spark key 0xCCDF7EE0, low word first (dji-firmware-tools issue #258)
+    if (tryKey(KEY_SPARK, SEC_UNSEALED, F("Spark key 0xCCDF7EE0"))) return true;
+    Serial.println(F("[U] Spark key failed — trying TI default 0x36720414"));
+    if (tryKey(KEY_TI_UNS, SEC_UNSEALED, F("TI key"))) return true;
+    Serial.println(F("[!] Still sealed. Check contacts (T) and keep the 9V boost held."));
+    return false;
 }
 
-// Try all three PF-clear approaches and report exactly which ACK/NACK.
-// DJI Battery Killer works in Unsealed mode, so 0x002A/0x002B via 0x44 are the most likely path.
-void doClearPF() {
-    // Timeouts (not NACKs) on these commands mean the chip accepted and is clock-stretching
-    // during a flash write — that is expected and means the command ran.
-    Serial.println(F("[P] Sending PF clear commands (timeouts = chip processing, that's OK):"));
-    busTimeout(BUS_TIMEOUT_SLOW_US);
+bool doFullAccess() {
+    Serial.println(F("[F] Full Access (not needed for PF clear)"));
+    if (readSec() == SEC_SEALED && !doUnseal()) return false;
+    if (tryKey(KEY_TI_FULL, SEC_FULL, F("TI FA key 0xFFFFFFFF"))) return true;
+    Serial.println(F("[!] Full Access not available with the default key."));
+    return false;
+}
 
-    uint8_t r1 = macSend(MAC_PF_CLEAR);            // 0x002A → reg 0x44
-    Serial.print(F("[P]   0x002A -> reg 0x44 : "));
-    Serial.println(busResultStr(r1));
-    delay(300);
+// PermanentFailDataReset (0x0029) via 0x00, verified after each attempt.
+// 0x002A/0x002B (sent by earlier versions) are BlackBoxRecorderReset and LED
+// toggle — not PF clears — and are no longer sent.
+bool doClearPF() {
+    Serial.println(F("[P] PermanentFailDataReset (0x0029)"));
+    uint8_t sec = readSec();
+    if (sec == SEC_SEALED) { Serial.println(F("[!] Chip is sealed — run U first.")); return false; }
+    if (sec == 0)          { Serial.println(F("[!] OperationStatus unreadable.")); return false; }
 
-    uint8_t r2 = macSend(MAC_PF2_CLEAR);           // 0x002B → reg 0x44
-    Serial.print(F("[P]   0x002B -> reg 0x44 : "));
-    Serial.println(busResultStr(r2));
-    delay(300);
-
-    uint8_t r3 = mac00Write(MAC_PF_DATA_RESET);    // 0x0029 → reg 0x00 (needs FA but try anyway)
-    Serial.print(F("[P]   0x0029 -> reg 0x00 : "));
-    Serial.println(busResultStr(r3));
-    delay(1000);
-
+    busTimeout(BUS_TIMEOUT_SLOW_US);   // chip clock-stretches during the flash write
+    bool ok = false;
+    for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+        uint8_t r = mac00Write(MAC_PF_DATA_RESET);
+        delay(1000);
+        uint32_t pfs;
+        bool still = pfActive(&pfs);
+        Serial.print(F("[P]   attempt ")); Serial.print(attempt);
+        Serial.print(' '); Serial.print(busResultStr(r));
+        Serial.print(F("  PF status ")); printHex32(pfs);
+        Serial.println(still ? F("  (still set)") : F("  (cleared)"));
+        if (!still) { ok = true; break; }
+    }
     busTimeout(BUS_TIMEOUT_FAST_US);
-
-    uint8_t buf[8] = {0};
-    uint8_t n = macCmd(MAC_PF_STATUS, buf, sizeof(buf));
-    if (n < 2) {
-        Serial.println(F("[?] PF status unreadable after commands."));
-        Serial.println(F("    Run R, then U, then 1 to re-check PF status after reset."));
-        return;
-    }
-    uint32_t pf = (uint32_t)buf[0] | ((uint32_t)buf[1]<<8)
-                | ((uint32_t)buf[2]<<16) | ((uint32_t)buf[3]<<24);
-    if (!pf) {
-        Serial.println(F("[OK] All PF flags cleared!"));
-    } else {
-        Serial.print(F("[?] PF still: "));
-        printHex32(pf);
-        Serial.println();
-    }
+    if (ok) Serial.println(F("[OK] PF cleared."));
+    else    Serial.println(F("[?] PF still set. It may only update after reset (R)."));
+    return ok;
 }
 
+// DeviceReset, then watch for the PF re-latching. With a cell below ~2.2 V the
+// BMS logs the undervoltage PF again 2-3 s after it restarts.
 void doReset() {
-    Serial.println(F("[R] Sending chip reset..."));
+    Serial.println(F("[R] DeviceReset (0x0041)"));
     busTimeout(BUS_TIMEOUT_SLOW_US);
     mac00Write(MAC_RESET);
-    delay(2500);
     busTimeout(BUS_TIMEOUT_FAST_US);
-    int32_t v = readWord(R_VOLTAGE);
-    if (v >= 0) {
-        Serial.print(F("[OK] BMS restarted. Voltage: "));
-        Serial.print(v);
-        Serial.println(F(" mV"));
+    bool back = false;
+    for (uint8_t i = 0; i < 30; i++) {           // up to ~3 s to reboot
+        delay(100);
+        if (present()) { back = true; break; }
+    }
+    if (!back) {
+        Serial.println(F("[!] No reply after reset — 9V boost dropped, or cells too flat."));
+        return;
+    }
+    Serial.println(F("[OK] BMS restarted (comes back sealed)."));
+    delay(5000);                                  // past the re-latch window
+    uint32_t pfs;
+    if (pfActive(&pfs)) {
+        Serial.print(F("[!] PF RE-LATCHED within 5 s of reset: ")); printHex32(pfs); Serial.println();
+        Serial.println(F("    A cell is still below the undervoltage threshold (press H)."));
+        Serial.println(F("    Clearing again will not hold until the cells come up."));
     } else {
-        Serial.println(F("[!] No reply after reset — normal if very low voltage."));
+        Serial.println(F("[OK] PF still clear 5 s after reset."));
     }
 }
 
 void doSeal() {
-    Serial.println(F("[L] Sealing battery..."));
-    // First attempt — may NACK if chip is guarding while PF is active; retry once
+    Serial.println(F("[L] Seal (0x0030)"));
+    uint8_t sec = readSec();
+    if (sec == SEC_SEALED) { Serial.println(F("[OK] Already sealed.")); return; }
     mac00Write(MAC_SEAL);
-    delay(500);
-    uint8_t sec = 3;
-    readSealState(sec);
-    if (sec != 3) {
-        Serial.println(F("[L] First seal attempt pending — retrying..."));
-        mac00Write(MAC_SEAL);
-        delay(500);
-        readSealState(sec);
-    }
-    Serial.print(sec == 3 ? F("[OK] Seal state: ") : F("[!] Seal state: "));
-    if (sec == 3) Serial.println(F("Sealed"));
-    else          Serial.println(F("Not sealed — chip may need Reset first"));
+    delay(300);
+    sec = readSec();
+    Serial.print(sec == SEC_SEALED ? F("[OK] State: ") : F("[!] State: "));
+    Serial.println(secName(sec));
 }
 
 // Wiring self-test — works with NO battery connected.
@@ -660,32 +695,54 @@ void scanBus() {
 }
 
 void autoRecover() {
-    Serial.println(F("\n[A] AUTO RECOVERY — mirrors DJI Battery Killer sequence"));
-    Serial.println(F("    Unseal -> Clear PF (two passes) -> Reset -> Seal\n"));
+    Serial.println(F("\n[A] AUTO RECOVERY: Unseal -> Clear PF -> Reset (-> second round) -> Seal\n"));
 
-    int32_t v = readWord(R_VOLTAGE);
-    if (v < 0) {
+    if (!present()) {
         Serial.println(F("[!] No I2C response. Apply 9V boost first:"));
         Serial.println(F("    Touch 9V+ to Pin 3, 9V- to Pin 2, hold while running this."));
         return;
     }
-    Serial.print(F("[*] Pack voltage before: "));
-    Serial.print(v);
-    Serial.println(F(" mV"));
+    int32_t v = readWord(R_VOLTAGE);
+    Serial.print(F("[*] Pack voltage before: ")); Serial.print(v); Serial.println(F(" mV"));
 
-    doUnseal();   delay(400);
-    doClearPF();  delay(400);
-    doClearPF();  delay(400);   // second pass — some packs only clear on the repeat
-    doReset();    delay(2500);
+    const uint8_t cellReg[3] = { R_CELL1, R_CELL2, R_CELL3 };
+    int32_t vmin = 0;
+    for (uint8_t i = 0; i < 3; i++) {
+        int32_t cv = readWord(cellReg[i]);
+        if (cv > 0 && (!vmin || cv < vmin)) vmin = cv;
+    }
+    if (vmin) {
+        Serial.print(F("[*] Lowest cell: ")); Serial.print(vmin); Serial.println(F(" mV"));
+        if (vmin < 2200)
+            Serial.println(F("[!] Below ~2.2 V: expect PF to re-latch after reset. Proceeding anyway."));
+        if (vmin < 2000)
+            Serial.println(F("[!] Below 2.0 V: the cell may be damaged. Supervise any charge closely."));
+    }
+
+    if (!doUnseal()) return;
+    delay(200);
+    doClearPF();
+    delay(200);
+    doReset();
+
+    uint32_t pfs;
+    bool still = pfActive(&pfs);
+    if (still) {
+        Serial.println(F("\n[A] PF still active after reset — second round..."));
+        if (doUnseal()) { doClearPF(); doReset(); }
+        still = pfActive(&pfs);
+    }
     doSeal();
 
     v = readWord(R_VOLTAGE);
-    Serial.print(F("[*] Pack voltage after:  "));
-    Serial.print(v);
-    Serial.println(F(" mV\n"));
-    Serial.println(F("[DONE] Now plug into the DJI charger."));
-    Serial.println(F("       Normal charging = alternating LEDs."));
-    Serial.println(F("       Still flashing 1+2 = try Auto again, or hold 9V longer."));
+    Serial.print(F("[*] Pack voltage after:  ")); Serial.print(v); Serial.println(F(" mV\n"));
+    if (still) {
+        Serial.println(F("[!] PF still active. If H shows a cell below ~2.2 V, the cells"));
+        Serial.println(F("    must come up before a clear will hold (see README: pumping)."));
+    } else {
+        Serial.println(F("[DONE] PF clear. Plug into the DJI charger and supervise the first charge."));
+        Serial.println(F("       Normal charging = alternating LEDs."));
+    }
 }
 
 // ── Arduino entry points ──────────────────────────────────────────────────
@@ -694,14 +751,16 @@ void printMenu() {
     Serial.println(F("\n======================================="));
     Serial.println(F("  DJI Spark Battery Recovery — Nano"));
     Serial.println(F("======================================="));
-    Serial.println(F("  1  Read battery status"));
+    Serial.println(F("  1  Read battery status (security, PF, FETs, faults)"));
     Serial.println(F("  H  Battery health (cells, wear, serial no.)"));
     Serial.println(F("  S  Scan I2C bus"));
     Serial.println(F("  W  Wiring self-test (no battery needed)"));
     Serial.println(F("  T  Bus stress test (run before recovery if no pull-up resistors)"));
+    Serial.println(F("  D  One CSV status line (read-only, for monitor scripts)"));
     Serial.println(F("  U  Unseal (Spark: 0xCCDF7EE0, fallback TI defaults)"));
-    Serial.println(F("  P  Clear PF (all Permanent Fail flags)"));
-    Serial.println(F("  R  Reset chip"));
+    Serial.println(F("  F  Full Access (TI default key; not needed for PF clear)"));
+    Serial.println(F("  P  Clear PF (PermanentFailDataReset 0x0029, verified)"));
+    Serial.println(F("  R  Reset chip (then checks whether PF re-latches)"));
     Serial.println(F("  L  Seal (re-lock)"));
     Serial.println(F("  A  Auto: full recovery sequence"));
     Serial.println(F("---------------------------------------"));
@@ -714,7 +773,7 @@ void setup() {
 
     Serial.println(F("\n========================================="));
     Serial.println(F("  DJI Spark Battery Recovery — Nano"));
-    Serial.println(F("  BQ40Z307 via I2C  (no CP2112 needed)"));
+    Serial.println(F("  BQ40Z307 via SMBus  (no CP2112 needed)"));
     Serial.println(F("========================================="));
     Serial.println(F("  SDA -> A4,  SCL -> A5,  GND -> GND"));
     Serial.println(F("  4.7 kOhm pull-ups on SDA & SCL to 5V"));
@@ -742,7 +801,9 @@ void loop() {
         case 'S': scanBus();        break;
         case 'W': wiringTest();     break;
         case 'T': busStressTest();  break;
+        case 'D': printDump();      return;   // no menu: keeps the CSV stream clean
         case 'U': doUnseal();       break;
+        case 'F': doFullAccess();   break;
         case 'P': doClearPF();      break;
         case 'R': doReset();        break;
         case 'L': doSeal();         break;
