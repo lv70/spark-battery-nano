@@ -51,7 +51,7 @@ Hold the Spark battery upright with the connector pins at the top, facing you. N
 | 5 | GND | nothing |
 | 6 | SDA (data) | Nano **A4** |
 
-**Getting a good contact.** The connector is made for a plug, not for loose pins, and bad contact is the most common problem. Bend the last 2 mm of each jumper pin slightly so the tip presses against the metal inside the slot. Tape the wires to the battery body so they cannot twist out.
+**Getting a good contact.** Push each jumper pin straight into its slot until it sits flush with the battery body. Ordinary male Dupont pins fit and grip well enough; that is how all three packs in this guide were done. If `T` in Step 5 reports errors, bend the last 2 mm of the pin slightly so the tip presses against the metal inside the slot, and tape the wires to the battery so they cannot twist out.
 
 ---
 
@@ -202,7 +202,7 @@ A pack whose cells were ever below 2.0 V is best kept as a bench or test battery
 | No port appears | The USB cable is charge-only. Swap it. Otherwise install the CH340 driver |
 | `W` says FAIL | That resistor is missing, in the wrong row, or on the dead half of the rail |
 | `S` says `Nothing found!` | Unplug the battery and press `W` first. If `W` passes: 9V not connected or flat, pins 1 and 6 swapped, pin 2 not on the same ground as the Nano |
-| `T` shows errors | A pin is not gripping. Bend the tips, re-seat, tape down |
+| `T` shows errors | A pin is not gripping. Push it in flush. If that is not enough, bend the tip slightly and tape the wires down |
 | `OpStatus : unreadable` | Same as above: the chip is not answering properly |
 | `Chip is sealed — run U first` | Press `U`, then `P` |
 | `PF RE-LATCHED within 5 s of reset` | A cell is under 2.2 V. Step 7 |
