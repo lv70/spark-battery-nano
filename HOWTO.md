@@ -91,6 +91,8 @@ Easiest on a breadboard:
 
 **Do not connect anything to battery pins 3, 4, or 5 yet.** The Nano itself is powered by its USB cable only.
 
+Build the Nano side first and leave the three wires loose at the battery end. Step 3 includes a self-test (`W`) that proves the resistors and rails are right before the battery is involved; plug the battery in only after it passes.
+
 > **Why 5V is acceptable here:** the BQ40Z307 is designed for laptop-style battery buses and its data pins are rated for 5V signals. On an I2C bus nothing actively drives the lines high; only the pull-up resistors do.
 
 ## Step 3: Install the software
@@ -109,6 +111,8 @@ Easiest on a breadboard:
 7. In the IDE, from the menu bar: **Tools → Serial Monitor** and set the speed dropdown at the bottom to **115200 baud**.
 
 You should see the welcome banner and a menu. Garbage characters mean the baud rate is wrong.
+
+8. **Before connecting the battery, press `W`** (wiring self-test). It checks that each data line is lifted high by its pull-up resistor and that the two lines are not shorted together, with nothing attached. Expect both `SDA (A4) pull-up: OK` and `SCL (A5) pull-up: OK`. A `FAIL` on either line means that resistor is missing, in the wrong breadboard row, or on a dead part of the 5V rail (breadboard rails often have a break in the middle). Fix it and press `W` again until both pass. A bus scan can never succeed with a failed pull-up, so this one test saves a lot of poking at the battery connector.
 
 ## Step 4: Wake the dead battery (9V boost)
 
@@ -214,7 +218,7 @@ Charge the battery on a fireproof surface and check on it periodically. When ful
 | Serial Monitor shows nothing / garbage | Baud rate must be **115200** (dropdown at bottom of Serial Monitor) |
 | Upload fails (`stk500` errors) | Toggle **Tools → Processor** between **ATmega328P** and **ATmega328P (Old Bootloader)**; it must match the bootloader on your clone. Also check the Port menu. |
 | No port in the Port menu | A charge-only USB cable is the usual cause; swap for a data cable. Otherwise install the CH340 driver. |
-| `Nothing found!` when pressing `S` | Chip has no power: do the 9V boost while scanning. Also re-check: Pin 6→A4, Pin 1→A5, Pin 2→GND, both resistors in place |
+| `Nothing found!` when pressing `S` | First unplug the battery and press `W`: a failed pull-up explains it on its own. If `W` passes, the chip has no power (do the 9V boost while scanning) or the battery-end wiring is wrong: Pin 6→A4, Pin 1→A5, Pin 2→GND, and the 9V negative on the same ground rail as the Nano |
 | `READ ERROR` on voltage | Same causes as above |
 | `Chip is sealed — run U first` | Press `U`, then `P`. If `U` fails five times, check contacts (`T`) and the 9V boost |
 | `OpStatus : unreadable` | The chip is not answering the status subcommands. Usually a contact problem: run `T` and re-seat the pins |
